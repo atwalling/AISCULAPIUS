@@ -206,3 +206,65 @@ Commit your changes with clear, descriptive messages.
 Submit a pull request for review.
 Please refer to our CONTRIBUTING.md (if provided) for detailed guidelines.
 
+
+
+
+
+flowchart -------->>>>>>
+    A[User Input:\n"Research Topic"]
+    
+    B[PubMed Interpretation & Memorization\n• Fetch new articles via PubMed API\n• Process abstracts & generate summaries via ChatGPT\n• Compute semantic similarity with stored summaries\n• Memorize novel insights]
+    
+    C[Disease Prioritization & Target Selection\n• Ingest epidemiological data (incidence, mortality, economic burden, unmet need)\n• Normalize & compute composite scores\n• Rank diseases & map to molecular targets]
+    
+    D[Target Validation & Novelty Filtering\n• Retrieve known targets (molecules/proteins) from curated library\n• Compute similarity (Tanimoto/sequence alignment)\n• Filter out redundant or over-explored targets]
+    
+    E[Candidate Diversification & Exploration\n• Generate multiple candidate variants using generative perturbations\n• Evaluate chemical diversity via fingerprint similarity\n• Update historical memory to avoid re‑exploration]
+    
+    F[ADMET & Drug‑Likeness Prediction\n• Compute molecular descriptors (e.g., via RDKit)\n• Predict ADMET properties using neural networks with Monte Carlo dropout\n• Compute composite drug‑likeness scores]
+    
+    G[Molecular Dynamics (MD) Simulation\n• Run multiple MD replicas to simulate protein–ligand interactions\n• Compute metrics (RMSD, binding free energy, interaction energy)\n• Aggregate results over replicas]
+    
+    H[Potential Combinations Module\n• Enumerate (or sample) combinations of candidates (size 2 to 10)\n• Aggregate multi-dimensional effect scores\n• Compute synergy score (weighted deficits vs. desired profile)\n• Incorporate dosage recommendations & LD50 estimates\n• Assess interaction risk (mechanistic overlap penalty)]
+    
+    I[Clinical Outcome Integration & Decision Support\n• Integrate candidate predictions with patient multi‑omics & epidemiological data\n• Apply multi‑criteria decision analysis to rank therapeutic options]
+    
+    J[Laboratory Automation & Experimental Planning\n• Schedule and simulate lab experiments (e.g., binding assays, cell tests)\n• Dynamically re‑schedule based on experimental feedback]
+    
+    K[Regulatory & Documentation Generation\n• Generate compliance‑ready documents using configurable templates\n• Embed metadata, audit trails, and expert interpretations]
+    
+    L[Data Integration & Management\n• Store all pipeline outputs, metadata, and logs in a central database\n• Provide APIs for querying and exporting historical run data]
+    
+    M[Continuous Improvement & Self‑Assessment\n• Aggregate historical performance (losses, synergy scores, safety metrics)\n• Compute trends and moving averages\n• Automatically adjust hyperparameters via meta‑learning\n• Generate periodic meta‑analysis reports]
+    
+    N[Graph‑RAG Module\n• Construct a dynamic knowledge graph from pipeline data (candidates, targets, diseases, etc.)\n• Compute node embeddings for semantic search\n• Enable context-aware querying via ChatGPT integration]
+    
+    O[Expert Collaboration & Communication\n• Collect and store expert feedback from various sources\n• Aggregate and summarize expert opinions using ChatGPT\n• Enable collaborative decision-making]
+    
+    P[Security, Compliance & Privacy\n• Encrypt sensitive data (using Fernet encryption)\n• Enforce role‑based access control and audit logging\n• Perform vulnerability scans and generate compliance reports]
+    
+    Q[Open Collaboration & Repository Integration\n• Integrate with GitHub for automated commits, versioning, and releases\n• Manage pull requests and issue tracking for open‑source collaboration]
+    
+    R[Admin Meta‑Analysis Module\n• Aggregate and analyze historical pipeline run data\n• Compute Pareto frontiers and multi‑objective optimization metrics\n• Generate strategic R&D insights and recommendations]
+    
+    S[Final Decision & Reporting\n• Aggregate outputs from all modules\n• Produce a comprehensive final report for decision makers\n• Highlight prioritized candidates and therapeutic combinations]
+    
+    %% Define flow connections
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+    H --> I
+    I --> J
+    J --> K
+    K --> L
+    L --> M
+    M --> N
+    N --> O
+    O --> P
+    P --> Q
+    Q --> R
+    R --> S
