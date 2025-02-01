@@ -1,0 +1,342 @@
+# advanced_feedback_continual_learning_agent_v2.py
+
+import logging
+import json
+import time
+from typing import Dict, Any, List
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+import openai  # For ChatGPT integration
+
+# Configure structured logging (here we simply output JSON-like strings).
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(message)s'
+)
+logger = logging.getLogger("AdvancedFeedbackContinualLearningAgent")
+
+class AdvancedFeedbackContinualLearningAgent:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the advanced continual learning agent.
+        
+        This agent aggregates multi-source feedback (simulation outputs, experimental results,
+        expert annotations, ChatGPT interpretations) and performs meta-learning updates on an ensemble
+        of models. It employs uncertainty weighting, adaptive learning rates, and maintains a history log.
+        
+        Config parameters include:
+          - FEEDBACK_LEARNING_RATE: Base learning rate for model updates.
+          - BATCH_SIZE: Batch size for feedback updates.
+          - DEVICE: 'cuda' or 'cpu'
+          - MODEL_REGISTRY: Dict of models to update, e.g. {"property_predictor": model, ...}.
+          - META_UPDATE_STRATEGY: e.g., "cosine_warm_restarts" for scheduler.
+          - UNCERTAINTY_WEIGHT: Base factor for weighting uncertainty.
+          - CHATGPT_MODEL: Model to use (e.g. "gpt-4").
+          - OPENAI_API_KEY: API key for ChatGPT.
+          - HISTORY_LOG: Whether to maintain historical logs.
+          - USE_LOOKAHEAD: Whether to wrap optimizers with a Lookahead wrapper.
+        """
+        self.config = config
+        self.feedback_lr = config.get("FEEDBACK_LEARNING_RATE", 0.001)
+        self.batch_size = config.get("BATCH_SIZE", 16)
+        self.device = torch.device(config.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+        self.uncertainty_weight = config.get("UNCERTAINTY_WEIGHT", 1.0)
+        self.meta_update_strategy = config.get("META_UPDATE_STRATEGY", "cosine_warm_restarts")
+        self.chatgpt_model = config.get("CHATGPT_MODEL", "gpt-4")
+        self.openai_api_key = config.get("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            logger.error("No OpenAI API key provided in config!")
+            raise ValueError("Missing OpenAI API key for ChatGPT integration.")
+        openai.api_key = self.openai_api_key
+        self.history_log = config.get("HISTORY_LOG", True)
+        self.update_history = []  # In-memory memory bank for historical logs
+
+        # Initialize the model registry.
+        # The registry can contain multiple models to update (e.g., property_predictor, guide_predictor).
+        self.model_registry = config.get("MODEL_REGISTRY", {})
+        if not self.model_registry:
+            logger.warning("MODEL_REGISTRY is empty; initializing a dummy property predictor.")
+            dummy_model = nn.Sequential(
+                nn.Linear(config.get("LATENT_DIM", 32), 64),
+                nn.ReLU(),
+                nn.Dropout(0.1),  # Enable dropout for uncertainty estimation.
+                nn.Linear(64, 3)
+            ).to(self.device)
+            self.model_registry["property_predictor"] = dummy_model
+
+        for name, model in self.model_registry.items():
+            model.train()  # Set models to training mode for updates.
+
+        # Create optimizers using AdamW and wrap with Lookahead if specified.
+        self.optimizers = {}
+        for name, model in self.model_registry.items():
+            base_optimizer = optim.AdamW(model.parameters(), lr=self.feedback_lr)
+            if config.get("USE_LOOKAHEAD", True):
+                # Simple Lookahead implementation: perform a fixed number of slow updates.
+                self.optimizers[name] = Lookahead(base_optimizer, k=5, alpha=0.5)
+            else:
+                self.optimizers[name] = base_optimizer
+
+        # Set up learning rate schedulers: CosineAnnealingWarmRestarts.
+        self.schedulers = {}
+        for name, optimizer in self.optimizers.items():
+            self.schedulers[name] = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+
+        logger.info(json.dumps({
+            "timestamp": time.ctime(),
+            "event": "AgentInitialized",
+            "device": str(self.device),
+            "models": list(self.model_registry.keys())
+        }))
+
+    def _simulate_feedback_loss(self, feedback_data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """
+        Compute feedback losses for each model in the registry.
+        
+        Feedback data is expected to include:
+          - "ground_truth": numpy array [B, 3]
+          - "predictions": dict mapping model names to numpy arrays [B, 3]
+          - "uncertainties": dict mapping model names to uncertainty estimates (e.g., variance)
+        Returns a dict of losses per model.
+        """
+        losses = {}
+        ground_truth = feedback_data.get("ground_truth")
+        if ground_truth is None:
+            logger.warning("No ground truth provided in feedback; defaulting to zero loss for all models.")
+            for name in self.model_registry.keys():
+                losses[name] = torch.tensor(0.0, device=self.device)
+            return losses
+
+        gt_tensor = torch.tensor(ground_truth, dtype=torch.float32, device=self.device)
+        for name, preds in feedback_data.get("predictions", {}).items():
+            pred_tensor = torch.tensor(preds, dtype=torch.float32, device=self.device)
+            mse_loss = nn.MSELoss()(pred_tensor, gt_tensor)
+            # Incorporate uncertainty weighting if provided.
+            uncertainty = feedback_data.get("uncertainties", {}).get(name, np.ones(len(ground_truth)))
+            uncertainty_factor = torch.tensor(np.mean(uncertainty), dtype=torch.float32, device=self.device)
+            weighted_loss = mse_loss * self.uncertainty_weight * uncertainty_factor
+            losses[name] = weighted_loss
+            logger.debug(json.dumps({
+                "event": "FeedbackLossComputed",
+                "model": name,
+                "loss": weighted_loss.item(),
+                "uncertainty_factor": uncertainty_factor.item()
+            }))
+        return losses
+
+    def update_models(self, feedback_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update all models in the registry using the provided feedback data.
+        Each model is updated with its optimizer and scheduler.
+        Returns a summary dictionary containing losses, parameter norms, and current learning rates.
+        """
+        update_summary = {}
+        losses = self._simulate_feedback_loss(feedback_data)
+        for name, model in self.model_registry.items():
+            optimizer = self.optimizers[name]
+            scheduler = self.schedulers[name]
+            optimizer.zero_grad()
+            loss = losses.get(name, torch.tensor(0.0, device=self.device))
+            loss.backward()
+            # Gradient clipping for stability.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            scheduler.step()
+            param_norms = {n: p.norm().item() for n, p in model.named_parameters()}
+            current_lr = optimizer.param_groups[0]["lr"]
+            update_summary[name] = {
+                "loss": loss.item(),
+                "parameter_norms": param_norms,
+                "learning_rate": current_lr
+            }
+            logger.info(json.dumps({
+                "timestamp": time.ctime(),
+                "event": "ModelUpdated",
+                "model": name,
+                "loss": loss.item(),
+                "learning_rate": current_lr
+            }))
+        if self.history_log:
+            self.update_history.append({
+                "timestamp": time.time(),
+                "update_summary": update_summary,
+                "feedback_data": feedback_data
+            })
+        return update_summary
+
+    def _aggregate_history(self) -> Dict[str, Any]:
+        """
+        Aggregate historical update metrics (e.g., average loss, trends in parameter norms).
+        This can be used for meta-learning adjustments.
+        """
+        if not self.update_history:
+            return {}
+        losses = []
+        for record in self.update_history:
+            for model_data in record["update_summary"].values():
+                losses.append(model_data["loss"])
+        avg_loss = np.mean(losses)
+        trend = "improving" if losses[-1] < avg_loss else "declining"
+        aggregated = {"average_loss": avg_loss, "recent_trend": trend}
+        logger.debug(json.dumps({
+            "event": "HistoryAggregated",
+            "aggregated_metrics": aggregated
+        }))
+        return aggregated
+
+    def _generate_feedback_summary(self, update_summary: Dict[str, Any]) -> str:
+        """
+        Generate a detailed, human-readable update summary.
+        This summary includes model update details and aggregated history.
+        """
+        aggregated = self._aggregate_history()
+        summary = {
+            "timestamp": time.ctime(),
+            "update_summary": update_summary,
+            "aggregated_history": aggregated
+        }
+        summary_str = json.dumps(summary, indent=2)
+        return summary_str
+
+    def _send_summary_to_chatgpt(self, summary: str) -> str:
+        """
+        Send the update summary to ChatGPT for interpretation and hyperparameter recommendations.
+        Returns ChatGPT's analysis as a string.
+        """
+        try:
+            prompt = (
+                "You are an expert in continuous learning and model optimization. Below is a detailed summary of recent "
+                "model updates from an advanced drug discovery pipeline. Provide a critical analysis, including suggestions "
+                "for further hyperparameter tuning, potential sources of high uncertainty, and recommendations to improve "
+                "model robustness.\n\nSummary:\n" + summary + "\n\nYour analysis:"
+            )
+            response = openai.ChatCompletion.create(
+                model=self.chatgpt_model,
+                messages=[
+                    {"role": "system", "content": "You are a cutting-edge expert in AI optimization and meta-learning."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=300,
+            )
+            analysis = response.choices[0].message["content"].strip()
+            logger.info(json.dumps({
+                "timestamp": time.ctime(),
+                "event": "ChatGPTAnalysisReceived"
+            }))
+            return analysis
+        except Exception as e:
+            logger.error(json.dumps({
+                "timestamp": time.ctime(),
+                "event": "ChatGPTAnalysisError",
+                "error": str(e)
+            }))
+            return "Error: Failed to obtain analysis from ChatGPT."
+
+    def run(self, feedback_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Integrate multi-source feedback and update all critical models.
+        
+        Workflow:
+          1. Receive feedback data (simulation outcomes, experimental measurements, expert annotations, etc.).
+          2. Compute composite losses with uncertainty weighting.
+          3. Update each model in the registry with adaptive optimizers and schedulers.
+          4. Aggregate historical metrics and generate a detailed update summary.
+          5. Send the summary to ChatGPT for expert analysis and hyperparameter recommendations.
+          6. Return a comprehensive report including update summaries, ChatGPT analysis, raw feedback, and history.
+        """
+        logger.info(json.dumps({
+            "timestamp": time.ctime(),
+            "event": "FeedbackUpdateStart",
+            "message": "Starting advanced feedback integration and model updates."
+        }))
+        update_summary = self.update_models(feedback_data)
+        summary_str = self._generate_feedback_summary(update_summary)
+        chatgpt_analysis = self._send_summary_to_chatgpt(summary_str)
+        overall_report = {
+            "update_summary": update_summary,
+            "chatgpt_analysis": chatgpt_analysis,
+            "raw_feedback": feedback_data,
+            "update_history": self.update_history
+        }
+        logger.info(json.dumps({
+            "timestamp": time.ctime(),
+            "event": "FeedbackUpdateComplete"
+        }))
+        return overall_report
+
+# -------------------------------
+# Lookahead Optimizer Wrapper
+# -------------------------------
+class Lookahead(optim.Optimizer):
+    """
+    Lookahead optimizer wrapper (simplified implementation).
+    Wraps a base optimizer and periodically updates a slow-moving copy of parameters.
+    """
+    def __init__(self, base_optimizer, k=5, alpha=0.5):
+        self.base_optimizer = base_optimizer
+        self.k = k
+        self.alpha = alpha
+        self.step_counter = 0
+        self.param_groups = self.base_optimizer.param_groups
+
+    def zero_grad(self):
+        self.base_optimizer.zero_grad()
+
+    def step(self):
+        loss = self.base_optimizer.step()
+        self.step_counter += 1
+        if self.step_counter % self.k == 0:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                    p.data = self.alpha * p.data + (1 - self.alpha) * p.data
+        return loss
+
+    def state_dict(self):
+        return self.base_optimizer.state_dict()
+
+    def load_state_dict(self, state_dict):
+        self.base_optimizer.load_state_dict(state_dict)
+
+# -------------------------------
+# Example usage (for testing purposes)
+# -------------------------------
+if __name__ == "__main__":
+    config = {
+        "FEEDBACK_LEARNING_RATE": 0.001,
+        "BATCH_SIZE": 16,
+        "DEVICE": "cuda",  # or "cpu"
+        "LATENT_DIM": 32,
+        "MODEL_REGISTRY": {},  # Empty dict to use dummy property predictor.
+        "META_UPDATE_STRATEGY": "cosine_warm_restarts",
+        "UNCERTAINTY_WEIGHT": 1.0,
+        "CHATGPT_MODEL": "gpt-4",
+        "OPENAI_API_KEY": "your_openai_api_key_here",  # Replace with your actual API key.
+        "HISTORY_LOG": True,
+        "USE_LOOKAHEAD": True
+    }
+    # Simulate dummy feedback: ground truth and predictions for a batch.
+    dummy_ground_truth = np.random.rand(16, 3).astype(np.float32)
+    dummy_predictions = {
+        "property_predictor": np.random.rand(16, 3).astype(np.float32)
+    }
+    dummy_uncertainties = {
+        "property_predictor": np.random.uniform(0.8, 1.2, size=(16,)).astype(np.float32)
+    }
+    feedback_data = {
+        "ground_truth": dummy_ground_truth,
+        "predictions": dummy_predictions,
+        "uncertainties": dummy_uncertainties
+    }
+    
+    agent = AdvancedFeedbackContinualLearningAgent(config)
+    report = agent.run(feedback_data)
+    print("Advanced Feedback & Continual Learning Report:")
+    print(json.dumps(report, indent=2))
