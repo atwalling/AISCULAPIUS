@@ -1,0 +1,206 @@
+# graph_rag_module.py
+
+import os
+import json
+import logging
+from datetime import datetime
+from typing import Dict, Any, List
+
+import networkx as nx
+import numpy as np
+from sentence_transformers import SentenceTransformer, util
+import openai
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "GraphRAGModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("GraphRAGModule")
+
+class GraphRAGModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Graph-RAG Module.
+        
+        Config parameters:
+          - GRAPH_DATA_FILE: Path to a JSON file containing pre-compiled pipeline outputs for graph construction.
+            The JSON should represent a list of records where each record is an entity with fields:
+              "id", "type", "description", and optionally "relations" (list of target IDs).
+          - TOP_K: Number of top nodes to retrieve for each query.
+          - CHATGPT_MODEL: Model to use for ChatGPT (e.g., "gpt-4").
+          - OPENAI_API_KEY: API key for ChatGPT integration.
+          - DEVICE: "cuda" or "cpu" for SentenceTransformer.
+        """
+        self.config = config
+        self.graph_data_file = config.get("GRAPH_DATA_FILE", None)
+        self.top_k = config.get("TOP_K", 5)
+        self.chatgpt_model = config.get("CHATGPT_MODEL", "gpt-4")
+        self.openai_api_key = config.get("OPENAI_API_KEY", None)
+        if self.openai_api_key:
+            openai.api_key = self.openai_api_key
+        else:
+            logger.warning("No OpenAI API key provided; ChatGPT integration will fail.")
+        self.device = config.get("DEVICE", "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
+        # Initialize the SentenceTransformer for embeddings.
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2", device=self.device)
+        # Build the graph.
+        self.graph = self._build_graph()
+        # Compute and store embeddings for each node.
+        self.node_embeddings = self._compute_node_embeddings()
+        logger.info("Graph-RAG Module initialized.")
+
+    def _build_graph(self) -> nx.DiGraph:
+        """
+        Build a directed graph from the pipeline data.
+        
+        If GRAPH_DATA_FILE is provided and exists, load entities from file.
+        Otherwise, create dummy data.
+        
+        Returns a networkx DiGraph.
+        """
+        G = nx.DiGraph()
+        if self.graph_data_file and os.path.exists(self.graph_data_file):
+            try:
+                with open(self.graph_data_file, "r") as f:
+                    entities = json.load(f)
+                logger.info(f"Loaded {len(entities)} entities from {self.graph_data_file}.")
+            except Exception as e:
+                logger.error(f"Error loading graph data: {e}")
+                entities = []
+        else:
+            logger.warning("No graph data file provided; generating dummy graph data.")
+            # Create dummy entities.
+            entities = [
+                {"id": "DiseaseA", "type": "Disease", "description": "Alzheimer's disease affects memory and cognition."},
+                {"id": "Candidate_1", "type": "Candidate", "description": "Candidate_1 shows potential in binding to Beta-Amyloid."},
+                {"id": "Target_1", "type": "Target", "description": "Target_1 is a protein implicated in amyloid plaque formation."},
+                {"id": "Simulation_1", "type": "Simulation", "description": "MD simulation results indicate stable binding."},
+                {"id": "Candidate_2", "type": "Candidate", "description": "Candidate_2 is a novel molecule with unique scaffold."},
+                {"id": "Target_2", "type": "Target", "description": "Target_2 modulates tau protein aggregation."},
+                {"id": "DiseaseB", "type": "Disease", "description": "Parkinson's disease involves motor control issues."},
+            ]
+        # Add nodes to the graph.
+        for entity in entities:
+            node_id = entity.get("id")
+            G.add_node(node_id, **entity)
+        # Add dummy edges representing relationships.
+        # For example: Candidate_1 treats DiseaseA, Candidate_1 targets Target_1, Simulation_1 is linked to Candidate_1.
+        G.add_edge("Candidate_1", "DiseaseA", relation="treats")
+        G.add_edge("Candidate_1", "Target_1", relation="targets")
+        G.add_edge("Simulation_1", "Candidate_1", relation="derived_from")
+        G.add_edge("Candidate_2", "Target_2", relation="targets")
+        G.add_edge("Target_2", "DiseaseB", relation="implicated_in")
+        logger.info(f"Graph constructed with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
+        return G
+
+    def _compute_node_embeddings(self) -> Dict[str, np.ndarray]:
+        """
+        Compute a text embedding for each node in the graph based on its description.
+        
+        Returns a dictionary mapping node IDs to embedding vectors.
+        """
+        embeddings = {}
+        descriptions = []
+        node_ids = []
+        for node_id, data in self.graph.nodes(data=True):
+            desc = data.get("description", "")
+            node_ids.append(node_id)
+            descriptions.append(desc)
+        # Compute embeddings in batch.
+        embeddings_matrix = self.embedder.encode(descriptions, convert_to_numpy=True)
+        for node_id, emb in zip(node_ids, embeddings_matrix):
+            embeddings[node_id] = emb
+        logger.info("Computed embeddings for all graph nodes.")
+        return embeddings
+
+    def query_graph(self, query: str) -> Dict[str, Any]:
+        """
+        Process a natural language query, retrieve relevant nodes from the graph, and generate a detailed response via ChatGPT.
+        
+        Steps:
+          1. Compute the embedding for the query.
+          2. Compute cosine similarity between the query and each node embedding.
+          3. Retrieve the top-K most similar nodes and their data.
+          4. Build a context string from these nodes.
+          5. Send the context and query to ChatGPT for an expert-level answer.
+        
+        Returns a dictionary with:
+          - "retrieved_nodes": List of node data for the top-K nodes.
+          - "chatgpt_response": The answer generated by ChatGPT.
+        """
+        # Step 1: Compute query embedding.
+        query_embedding = self.embedder.encode(query, convert_to_numpy=True)
+        # Step 2: Compute cosine similarities.
+        similarities = {}
+        for node_id, emb in self.node_embeddings.items():
+            sim = np.dot(query_embedding, emb) / (np.linalg.norm(query_embedding) * np.linalg.norm(emb) + 1e-8)
+            similarities[node_id] = sim
+        # Step 3: Retrieve top-K nodes.
+        sorted_nodes = sorted(similarities.items(), key=lambda item: item[1], reverse=True)
+        top_nodes = sorted_nodes[:self.top_k]
+        retrieved_nodes = []
+        for node_id, score in top_nodes:
+            data = self.graph.nodes[node_id]
+            data_summary = {
+                "id": node_id,
+                "type": data.get("type", "Unknown"),
+                "description": data.get("description", ""),
+                "similarity": float(score)
+            }
+            retrieved_nodes.append(data_summary)
+        # Build context string.
+        context_lines = []
+        for node in retrieved_nodes:
+            line = f"{node['type']} {node['id']}: {node['description']} (Similarity: {node['similarity']:.2f})"
+            context_lines.append(line)
+        context_str = "\n".join(context_lines)
+        # Step 4: Prepare prompt for ChatGPT.
+        prompt = (
+            "You are a knowledgeable biomedical expert. Based on the following context extracted from the knowledge graph, "
+            "please answer the following query in detail:\n\n"
+            "Context:\n" + context_str + "\n\n"
+            "Query: " + query + "\n\n"
+            "Answer:"
+        )
+        # Step 5: Call ChatGPT.
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a highly knowledgeable biomedical expert with deep insights into drug discovery."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=300,
+            )
+            chatgpt_response = response.choices[0].message["content"].strip()
+        except Exception as e:
+            logger.error(f"Error calling ChatGPT: {e}")
+            chatgpt_response = "Error: Failed to generate response from ChatGPT."
+        result = {
+            "retrieved_nodes": retrieved_nodes,
+            "chatgpt_response": chatgpt_response
+        }
+        logger.info("Graph query processed successfully.")
+        return result
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the Graph-RAG Module.
+    config = {
+        "GRAPH_DATA_FILE": None,  # Use dummy graph data.
+        "TOP_K": 5,
+        "CHATGPT_MODEL": "gpt-4",
+        "OPENAI_API_KEY": "your_openai_api_key_here",  # Replace with your actual API key.
+        "DEVICE": "cpu"
+    }
+    
+    graph_rag = GraphRAGModule(config)
+    
+    # Example query.
+    query = "What candidate molecules show promise for treating Alzheimer's disease and what are their associated targets?"
+    result = graph_rag.query_graph(query)
+    print("Graph-RAG Query Result:")
+    print(json.dumps(result, indent=2))
