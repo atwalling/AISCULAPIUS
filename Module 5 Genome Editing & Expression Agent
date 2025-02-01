@@ -1,0 +1,305 @@
+# genome_editing_agent.py
+
+import logging
+import time
+from typing import Dict, Any, List
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+# Setup detailed logging for this module.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("GenomeEditingAgent")
+
+# -------------------------------
+# Constants and Helper Functions
+# -------------------------------
+
+NUCLEOTIDES = ["A", "C", "G", "T"]
+
+def soft_to_hard_sequence(soft_logits: torch.Tensor) -> str:
+    """
+    Convert a soft (differentiable) sequence representation (logits)
+    into a discrete guide RNA sequence by taking argmax over nucleotide dimensions.
+    
+    soft_logits: Tensor of shape [seq_length, 4].
+    Returns a string of length seq_length.
+    """
+    hard_indices = torch.argmax(soft_logits, dim=1).cpu().numpy()
+    sequence = "".join([NUCLEOTIDES[i] for i in hard_indices])
+    return sequence
+
+def initialize_soft_sequence(seq_length: int) -> torch.Tensor:
+    """
+    Initialize a soft sequence representation (logits) of shape [seq_length, 4]
+    with small random values.
+    """
+    # Start with random normal initialization.
+    initial_logits = torch.randn(seq_length, 4, requires_grad=True)
+    return initial_logits
+
+def validate_guide_sequence(guide: str) -> bool:
+    """
+    Validate the guide RNA sequence.
+    Here, we check that the sequence is of expected length.
+    """
+    if len(guide) != 20:
+        logger.warning(f"Guide RNA sequence '{guide}' is invalid (expected length 20).")
+        return False
+    return True
+
+# -------------------------------
+# Guide RNA Predictor Model
+# -------------------------------
+class GuideRNAPredictor(nn.Module):
+    """
+    A neural network that takes a soft guide RNA sequence (flattened logits) and predicts:
+      - On-target efficiency (higher is better)
+      - Off-target risk (lower is better)
+      - Expression boost (higher is better)
+    """
+    def __init__(self, seq_length: int, hidden_dim: int = 64):
+        super(GuideRNAPredictor, self).__init__()
+        input_dim = seq_length * 4  # Flattened soft representation.
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 3)  # Outputs: [on_target, off_target, expression_boost]
+    
+    def forward(self, soft_sequence: torch.Tensor) -> torch.Tensor:
+        x = soft_sequence.view(-1)
+        x = F.relu(self.fc1(x))
+        output = self.fc2(x)
+        return output
+
+# -------------------------------
+# Advanced Genome Editing & Expression Agent
+# -------------------------------
+class GenomeEditingAgent:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Genome Editing & Expression Agent.
+        
+        Config parameters include:
+          - GUIDE_SEQ_LENGTH: Length of the guide RNA sequence (e.g., 20 nt).
+          - MAX_OPT_ITERATIONS: Maximum iterations for optimizing the soft sequence.
+          - LEARNING_RATE: Learning rate for guide RNA optimization.
+          - NUM_GUIDE_CANDIDATES: Number of candidate initializations to try.
+          - PROPERTY_WEIGHTS: Weights for each property in the composite objective.
+              Example: { "on_target": -1.0, "off_target": 1.0, "expression_boost": -1.0 }
+          - GC_WEIGHT: Weight for the GC content penalty term.
+          - GRAD_CLIP: Maximum norm for gradient clipping.
+          - DEVICE: 'cuda' or 'cpu'
+        """
+        self.config = config
+        self.seq_length = config.get("GUIDE_SEQ_LENGTH", 20)
+        self.max_opt_iterations = config.get("MAX_OPT_ITERATIONS", 50)
+        self.learning_rate = config.get("LEARNING_RATE", 0.05)
+        self.num_candidates = config.get("NUM_GUIDE_CANDIDATES", 5)
+        self.property_weights = config.get("PROPERTY_WEIGHTS", {"on_target": -1.0, "off_target": 1.0, "expression_boost": -1.0})
+        self.gc_weight = config.get("GC_WEIGHT", 1.0)
+        self.grad_clip = config.get("GRAD_CLIP", 5.0)
+        self.device = torch.device(config.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+        
+        # Initialize the guide RNA predictor model.
+        self.guide_predictor = GuideRNAPredictor(self.seq_length).to(self.device)
+        self.guide_predictor.eval()
+        
+        logger.info("Genome Editing Agent initialized with advanced differentiable guide RNA optimization.")
+
+    def _compute_gc_penalty(self, soft_sequence: torch.Tensor) -> torch.Tensor:
+        """
+        Compute a differentiable GC content penalty.
+        Calculate the expected GC content from the softmax probabilities over nucleotides.
+        Desired GC content is 0.5. We use squared error as penalty.
+        """
+        soft_probs = torch.softmax(soft_sequence, dim=1)  # shape [seq_length, 4]
+        # Index 1 = C, index 2 = G.
+        gc_probs = soft_probs[:, 1] + soft_probs[:, 2]
+        expected_gc = torch.mean(gc_probs)
+        penalty = (expected_gc - 0.5) ** 2
+        return penalty
+
+    def _composite_objective(self, predictions: torch.Tensor, soft_sequence: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the composite objective for guide RNA optimization.
+        predictions: Tensor of shape [3] with outputs [on_target, off_target, expression_boost].
+        Also adds a GC content penalty computed from soft_sequence.
+        Lower objective values are preferred.
+        """
+        on_target, off_target, expression_boost = predictions[0], predictions[1], predictions[2]
+        base_obj = (self.property_weights["on_target"] * on_target +
+                    self.property_weights["off_target"] * off_target +
+                    self.property_weights["expression_boost"] * expression_boost)
+        gc_penalty = self._compute_gc_penalty(soft_sequence)
+        total_obj = base_obj + self.gc_weight * gc_penalty
+        return total_obj
+
+    def _optimize_guide(self) -> torch.Tensor:
+        """
+        Optimize a soft guide RNA sequence representation using gradient-based optimization
+        to minimize the composite objective. This routine runs multiple candidate initializations
+        and selects the best optimized soft sequence.
+        Returns the optimized soft sequence tensor of shape [seq_length, 4].
+        """
+        best_obj = float('inf')
+        best_soft_seq = None
+
+        for candidate_idx in range(self.num_candidates):
+            logger.debug(f"Initializing candidate guide {candidate_idx+1}/{self.num_candidates}")
+            soft_sequence = initialize_soft_sequence(self.seq_length).to(self.device)
+            soft_sequence.requires_grad_(True)
+            optimizer = optim.Adam([soft_sequence], lr=self.learning_rate)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+            candidate_best_obj = float('inf')
+            candidate_best_soft_seq = soft_sequence.detach().clone()
+            
+            for iteration in range(self.max_opt_iterations):
+                optimizer.zero_grad()
+                predictions = self.guide_predictor(soft_sequence)
+                objective = self._composite_objective(predictions, soft_sequence)
+                objective.backward()
+                # Apply gradient clipping.
+                torch.nn.utils.clip_grad_norm_([soft_sequence], self.grad_clip)
+                optimizer.step()
+                scheduler.step()
+                current_obj = objective.item()
+                logger.debug(f"Candidate {candidate_idx+1}, iteration {iteration+1}: composite objective = {current_obj:.4f}")
+                if current_obj < candidate_best_obj:
+                    candidate_best_obj = current_obj
+                    candidate_best_soft_seq = soft_sequence.detach().clone()
+            
+            logger.info(f"Candidate {candidate_idx+1} optimization complete. Best objective: {candidate_best_obj:.4f}")
+            if candidate_best_obj < best_obj:
+                best_obj = candidate_best_obj
+                best_soft_seq = candidate_best_soft_seq
+        
+        logger.info(f"Guide optimization completed. Selected candidate with objective: {best_obj:.4f}")
+        return best_soft_seq
+
+    def _simulate_genome_editing_outcome(self, guide: str, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Simulate the outcome of performing genome editing with the given guide RNA.
+        Returns predicted outcomes:
+          - Editing Efficiency: between 0 and 1.
+          - Predicted Expression: relative expression boost.
+          - Off-target Effects: a score where lower is better.
+        """
+        np.random.seed(sum(ord(c) for c in guide) % 2**32)
+        editing_efficiency = np.random.uniform(0.5, 0.95)
+        # Use candidate's binding affinity (more negative is better) to simulate expression boost.
+        binding_affinity = candidate.get("predicted_properties", {}).get("binding_affinity", -7.0)
+        predicted_expression = np.random.uniform(1.0, 2.0) * binding_affinity
+        off_target_effect = np.random.uniform(0, 0.2)
+        outcome = {
+            "editing_efficiency": editing_efficiency,
+            "predicted_expression": predicted_expression,
+            "off_target_effect": off_target_effect
+        }
+        logger.debug(f"Simulated genome editing outcome for guide {guide}: {outcome}")
+        return outcome
+
+    def _evaluate_guide(self, optimized_soft_seq: torch.Tensor) -> Dict[str, Any]:
+        """
+        Discretize the optimized soft sequence to obtain a final guide RNA,
+        validate it, and evaluate it using additional criteria.
+        """
+        guide_rna = soft_to_hard_sequence(optimized_soft_seq)
+        is_valid = validate_guide_sequence(guide_rna)
+        evaluation = {
+            "guide_rna": guide_rna,
+            "valid": is_valid,
+            "gc_content": None  # Will be computed next.
+        }
+        # Compute expected GC content from the optimized soft sequence.
+        with torch.no_grad():
+            soft_probs = torch.softmax(optimized_soft_seq, dim=1)
+        gc_content = torch.mean(soft_probs[:, 1] + soft_probs[:, 2]).item()
+        evaluation["gc_content"] = gc_content
+        return evaluation
+
+    def reason(self, protein: str, guide_evaluation: Dict[str, Any], outcome: Dict[str, Any]) -> None:
+        """
+        Log detailed reasoning behind the optimized guide RNA design.
+        Provides transparency by outputting all key metrics.
+        """
+        logger.info(f"Optimized guide RNA for {protein}: {guide_evaluation['guide_rna']}")
+        logger.info(f"Guide evaluation: valid = {guide_evaluation['valid']}, GC content = {guide_evaluation['gc_content']:.3f}")
+        logger.info(f"Simulated genome editing outcome: {outcome}")
+        return
+
+    def run(self, candidate_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        For each candidate molecule (keyed by protein) from the previous module,
+        design and optimize a CRISPR guide RNA sequence to enable genome editing for expression.
+        
+        The workflow is:
+          1. For each candidate, optimize a soft guide RNA sequence representation (with multiple initializations).
+          2. Discretize the best optimized soft sequence into a final guide RNA.
+          3. Validate the guide RNA and compute its GC content.
+          4. Simulate genome editing outcomes.
+          5. Log all agentic reasoning.
+        Returns a dictionary mapping each protein to its CRISPR design and predicted outcomes.
+        """
+        genome_editing_recommendations = {}
+        logger.info("Starting genome editing design for candidates: " + ", ".join(candidate_data.keys()))
+        for protein, candidate in candidate_data.items():
+            if "error" in candidate:
+                logger.error(f"Skipping genome editing design for {protein} due to candidate error: {candidate.get('error')}")
+                genome_editing_recommendations[protein] = {"error": candidate.get("error")}
+                continue
+
+            logger.info(f"Designing CRISPR guide for {protein} candidate: {candidate.get('smiles', 'N/A')}")
+            # Optimize the guide RNA representation using multiple candidate initializations.
+            optimized_soft_seq = self._optimize_guide()
+            # Discretize and evaluate the optimized guide RNA.
+            guide_evaluation = self._evaluate_guide(optimized_soft_seq)
+            if not guide_evaluation["valid"]:
+                logger.error(f"Optimized guide RNA for {protein} is invalid.")
+                genome_editing_recommendations[protein] = {"error": "Invalid guide RNA sequence generated."}
+                continue
+            # Simulate genome editing outcome.
+            outcome = self._simulate_genome_editing_outcome(guide_evaluation["guide_rna"], candidate)
+            # Log agentic reasoning.
+            self.reason(protein, guide_evaluation, outcome)
+            genome_editing_recommendations[protein] = {
+                "guide_RNA": guide_evaluation["guide_rna"],
+                "guide_evaluation": guide_evaluation,
+                "editing_outcome": outcome
+            }
+        logger.info("Genome editing design completed.")
+        return genome_editing_recommendations
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    config = {
+        "GUIDE_SEQ_LENGTH": 20,
+        "MAX_OPT_ITERATIONS": 50,
+        "LEARNING_RATE": 0.05,
+        "NUM_GUIDE_CANDIDATES": 5,
+        "PROPERTY_WEIGHTS": {"on_target": -1.0, "off_target": 1.0, "expression_boost": -1.0},
+        "GC_WEIGHT": 1.0,
+        "GRAD_CLIP": 5.0,
+        "DEVICE": "cuda"  # or "cpu"
+    }
+    agent = GenomeEditingAgent(config)
+    # Dummy candidate_data from Module 4; in practice, these come from optimized candidate molecules.
+    dummy_candidate_data = {
+        "ProteinX": {
+            "smiles": "CNOPSFClBrI=#$()123456789",
+            "predicted_properties": {"binding_affinity": -7.2, "synthetic_accessibility": 0.8, "toxicity": 2.1},
+            "latent": np.random.rand(32).astype(np.float32)
+        },
+        "ProteinY": {
+            "smiles": "NOPSFClBrI=#$()123456789C",
+            "predicted_properties": {"binding_affinity": -6.8, "synthetic_accessibility": 0.6, "toxicity": 3.0},
+            "latent": np.random.rand(32).astype(np.float32)
+        }
+    }
+    editing_output = agent.run(dummy_candidate_data)
+    print("Genome Editing Design Output:")
+    print(editing_output)
