@@ -1,0 +1,281 @@
+# target_validation_module.py
+
+import os
+import json
+import logging
+from typing import Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+# Attempt to import RDKit for molecular similarity.
+try:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, DataStructs
+except ImportError:
+    Chem = None
+    AllChem = None
+    DataStructs = None
+
+import openai  # For optional ChatGPT integration
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "TargetValidationModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("TargetValidationModule")
+
+
+class TargetValidationModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Target Validation & Novelty Filtering Module.
+        
+        Config parameters:
+          - KNOWN_TARGETS_FILE: Path to a CSV or JSON file containing known targets.
+              For molecular targets, the file should include a column "SMILES".
+              For protein targets, a column "Sequence" is expected.
+          - SIMILARITY_THRESHOLD: Maximum allowed similarity (e.g., 0.8) beyond which a candidate is considered non-novel.
+          - TARGET_TYPE: "molecule" or "protein" (determines similarity method).
+          - CHATGPT_MODEL: (Optional) Model to use for expert interpretation.
+          - OPENAI_API_KEY: (Optional) API key for ChatGPT integration.
+        """
+        self.config = config
+        self.known_targets_file = config.get("KNOWN_TARGETS_FILE", None)
+        self.similarity_threshold = config.get("SIMILARITY_THRESHOLD", 0.8)
+        self.target_type = config.get("TARGET_TYPE", "molecule")
+        self.chatgpt_model = config.get("CHATGPT_MODEL", "gpt-4")
+        self.openai_api_key = config.get("OPENAI_API_KEY", None)
+        if self.openai_api_key:
+            openai.api_key = self.openai_api_key
+        else:
+            logger.warning("No OpenAI API key provided; expert summarization will be skipped.")
+        
+        # Load known targets from file or use dummy data.
+        self.known_targets = self._load_known_targets()
+        logger.info("Target Validation Module initialized.")
+
+    def _load_known_targets(self) -> List[Dict[str, Any]]:
+        """
+        Load known targets from the specified file.
+        The file can be CSV or JSON. Expected columns:
+          - For molecular targets: "Target_ID", "SMILES"
+          - For protein targets: "Target_ID", "Sequence"
+        If no file is provided, dummy data is generated.
+        
+        Returns a list of dictionaries.
+        """
+        if self.known_targets_file and os.path.exists(self.known_targets_file):
+            try:
+                if self.known_targets_file.endswith(".csv"):
+                    df = pd.read_csv(self.known_targets_file)
+                elif self.known_targets_file.endswith(".json"):
+                    df = pd.read_json(self.known_targets_file)
+                else:
+                    logger.error("Unsupported file format for known targets.")
+                    raise ValueError("Unsupported file format for known targets.")
+                targets = df.to_dict(orient="records")
+                logger.info(f"Loaded {len(targets)} known targets from {self.known_targets_file}.")
+                return targets
+            except Exception as e:
+                logger.error(f"Error loading known targets: {e}")
+                raise e
+        else:
+            logger.warning("No known targets file provided; generating dummy data.")
+            if self.target_type == "molecule":
+                # Dummy molecular targets with SMILES.
+                dummy_targets = [
+                    {"Target_ID": "MolTarget1", "SMILES": "CCO"},
+                    {"Target_ID": "MolTarget2", "SMILES": "CCC"},
+                    {"Target_ID": "MolTarget3", "SMILES": "CCN"},
+                ]
+            elif self.target_type == "protein":
+                # Dummy protein targets with sequences.
+                dummy_targets = [
+                    {"Target_ID": "ProtTarget1", "Sequence": "MKTIIALSYIFCLVFAD"},
+                    {"Target_ID": "ProtTarget2", "Sequence": "MKAILVVLLYTFATANAD"},
+                    {"Target_ID": "ProtTarget3", "Sequence": "MKWVTFISLLFLFSSAYS"},
+                ]
+            else:
+                dummy_targets = []
+            return dummy_targets
+
+    def _compute_molecular_similarity(self, candidate_smiles: str, target_smiles: str) -> float:
+        """
+        Compute the Tanimoto similarity between two molecules given their SMILES strings.
+        Uses RDKit fingerprints.
+        Returns a float between 0 and 1.
+        """
+        if Chem is None or AllChem is None or DataStructs is None:
+            logger.warning("RDKit not available; returning dummy similarity 0.0.")
+            return 0.0
+        try:
+            cand_mol = Chem.MolFromSmiles(candidate_smiles)
+            target_mol = Chem.MolFromSmiles(target_smiles)
+            if cand_mol is None or target_mol is None:
+                logger.warning("Invalid SMILES provided; similarity set to 0.0.")
+                return 0.0
+            cand_fp = AllChem.GetMorganFingerprint(cand_mol, 2)
+            target_fp = AllChem.GetMorganFingerprint(target_mol, 2)
+            similarity = DataStructs.TanimotoSimilarity(cand_fp, target_fp)
+            return similarity
+        except Exception as e:
+            logger.error(f"Error computing molecular similarity: {e}")
+            return 0.0
+
+    def _compute_protein_similarity(self, candidate_seq: str, target_seq: str) -> float:
+        """
+        Compute a dummy similarity between two protein sequences.
+        In production, this could use BLAST, sequence embeddings, or alignment scores.
+        Here, we simulate by computing a simple normalized edit distance.
+        Returns a similarity score between 0 and 1 (1 means identical).
+        """
+        # For simplicity, use Levenshtein distance approximation.
+        # Since we might not have python-Levenshtein installed, we use a simple dynamic programming approach.
+        def levenshtein(s1: str, s2: str) -> int:
+            if len(s1) < len(s2):
+                return levenshtein(s2, s1)
+            if len(s2) == 0:
+                return len(s1)
+            previous_row = range(len(s2) + 1)
+            for i, c1 in enumerate(s1):
+                current_row = [i + 1]
+                for j, c2 in enumerate(s2):
+                    insertions = previous_row[j + 1] + 1
+                    deletions = current_row[j] + 1
+                    substitutions = previous_row[j] + (c1 != c2)
+                    current_row.append(min(insertions, deletions, substitutions))
+                previous_row = current_row
+            return previous_row[-1]
+        
+        distance = levenshtein(candidate_seq, target_seq)
+        max_len = max(len(candidate_seq), len(target_seq))
+        similarity = 1 - (distance / max_len)
+        return similarity
+
+    def validate_targets(self, candidate_targets: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate and filter candidate targets based on their novelty relative to known targets.
+        
+        candidate_targets: Dictionary mapping candidate target IDs to their representation.
+            For molecular targets, the representation is a SMILES string.
+            For protein targets, it is a sequence string.
+        
+        Returns a dictionary with:
+          - "validated_targets": A dictionary mapping candidate IDs to a dictionary containing:
+              - "novelty_score": A value between 0 and 1 (1 means completely novel).
+              - "max_similarity": Maximum similarity with any known target.
+              - "status": "novel" or "redundant" based on the similarity threshold.
+          - "filtered_out": List of candidate IDs deemed redundant.
+        """
+        results = {}
+        filtered_out = []
+        for cand_id, representation in candidate_targets.items():
+            max_similarity = 0.0
+            for target in self.known_targets:
+                if self.target_type == "molecule":
+                    target_repr = target.get("SMILES", "")
+                    similarity = self._compute_molecular_similarity(representation, target_repr)
+                elif self.target_type == "protein":
+                    target_repr = target.get("Sequence", "")
+                    similarity = self._compute_protein_similarity(representation, target_repr)
+                else:
+                    similarity = 0.0
+                if similarity > max_similarity:
+                    max_similarity = similarity
+            novelty_score = 1.0 - max_similarity  # Higher novelty means lower similarity.
+            status = "novel" if max_similarity < self.similarity_threshold else "redundant"
+            results[cand_id] = {
+                "novelty_score": novelty_score,
+                "max_similarity": max_similarity,
+                "status": status
+            }
+            if status == "redundant":
+                filtered_out.append(cand_id)
+            logger.debug(json.dumps({
+                "event": "TargetValidation",
+                "candidate_id": cand_id,
+                "novelty_score": novelty_score,
+                "max_similarity": max_similarity,
+                "status": status
+            }))
+        output = {"validated_targets": results, "filtered_out": filtered_out}
+        logger.info("Target validation and novelty filtering completed.")
+        return output
+
+    def generate_expert_summary(self, validation_report: Dict[str, Any]) -> str:
+        """
+        Generate an expert-level summary of the target validation results using ChatGPT.
+        Returns a string summary.
+        """
+        try:
+            prompt = (
+                "You are a biomedical expert. Below is a summary of target validation results from a drug discovery pipeline. "
+                "For each candidate target, the novelty score (1 = completely novel) and the maximum similarity with known targets are provided, "
+                "along with a status of 'novel' or 'redundant'. Please provide a concise expert interpretation, highlighting which targets "
+                "should be prioritized for further investigation, and any recommendations for improving target novelty filtering.\n\n"
+                + json.dumps(validation_report, indent=2) +
+                "\n\nExpert Summary:"
+            )
+            response = openai.ChatCompletion.create(
+                model=self.chatgpt_model,
+                messages=[
+                    {"role": "system", "content": "You are a highly knowledgeable biomedical research expert."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=250,
+            )
+            summary = response.choices[0].message["content"].strip()
+            logger.info("Expert summary generated via ChatGPT for target validation.")
+            return summary
+        except Exception as e:
+            logger.error(f"Error generating expert summary: {e}")
+            return "Expert summary unavailable due to an error."
+
+    def run(self, candidate_targets: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Run the full target validation and novelty filtering process.
+        
+        candidate_targets: Dictionary mapping candidate target IDs to their representation (SMILES for molecules, sequences for proteins).
+        
+        Returns a dictionary with:
+          - "validation_report": Detailed results for each candidate.
+          - "expert_summary": (Optional) Expert interpretation generated via ChatGPT.
+        """
+        validation_report = self.validate_targets(candidate_targets)
+        expert_summary = self.generate_expert_summary(validation_report)
+        output = {
+            "validation_report": validation_report,
+            "expert_summary": expert_summary
+        }
+        logger.info("Target Validation & Novelty Filtering Module completed.")
+        return output
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the module.
+    config = {
+        "KNOWN_TARGETS_FILE": None,  # Use dummy known targets.
+        "SIMILARITY_THRESHOLD": 0.8,
+        "TARGET_TYPE": "molecule",  # Change to "protein" to simulate protein target validation.
+        "CHATGPT_MODEL": "gpt-4",
+        "OPENAI_API_KEY": "your_openai_api_key_here"  # Replace with your actual API key.
+    }
+    
+    tv_module = TargetValidationModule(config)
+    
+    # Simulate candidate targets. For molecules, these are SMILES strings.
+    candidate_targets = {
+        "Candidate_1": "CCO",    # Ethanol (likely similar to a dummy known target if present)
+        "Candidate_2": "CCCC",   # Butane
+        "Candidate_3": "CCN",    # Ethylamine
+        "Candidate_4": "CCOC",   # Ethoxyethane
+        "Candidate_5": "CCCCO"   # Pentanol
+    }
+    
+    result = tv_module.run(candidate_targets)
+    print("Target Validation & Novelty Filtering Output:")
+    print(json.dumps(result, indent=2))
