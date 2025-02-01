@@ -1,0 +1,233 @@
+# disease_prioritization_module.py
+
+import os
+import json
+import logging
+from datetime import datetime
+from typing import Dict, Any, List
+
+import numpy as np
+import pandas as pd
+import openai  # For ChatGPT integration
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "DiseasePrioritizationModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("DiseasePrioritizationModule")
+
+
+class DiseasePrioritizationModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Disease Prioritization & Target Selection Module.
+        
+        Config parameters:
+          - EPIDEMIOLOGY_DATA_FILE: Path to epidemiology data (CSV/JSON); if None, dummy data is generated.
+          - TARGET_MAPPING_FILE: Path to a JSON file mapping diseases to potential molecular targets; if None, dummy mapping is used.
+          - CRITERIA_WEIGHTS: Dictionary of weights for criteria (e.g., {"incidence": 0.4, "mortality": 0.3, "economic_burden": 0.2, "unmet_need": 0.1}).
+          - TOP_N: Number of top diseases to select.
+          - CHATGPT_MODEL: Model name to use for ChatGPT (e.g., "gpt-4").
+          - OPENAI_API_KEY: API key for ChatGPT integration.
+        """
+        self.config = config
+        self.epi_data_file = config.get("EPIDEMIOLOGY_DATA_FILE", None)
+        self.target_mapping_file = config.get("TARGET_MAPPING_FILE", None)
+        self.criteria_weights = config.get("CRITERIA_WEIGHTS", {
+            "incidence": 0.4,
+            "mortality": 0.3,
+            "economic_burden": 0.2,
+            "unmet_need": 0.1
+        })
+        self.top_n = config.get("TOP_N", 5)
+        self.chatgpt_model = config.get("CHATGPT_MODEL", "gpt-4")
+        self.openai_api_key = config.get("OPENAI_API_KEY", None)
+        if self.openai_api_key:
+            openai.api_key = self.openai_api_key
+        else:
+            logger.warning("No OpenAI API key provided; ChatGPT summarization will fail.")
+        
+        self.epi_data = self._load_epidemiology_data()
+        self.target_mapping = self._load_target_mapping()
+        logger.info("Disease Prioritization Module initialized.")
+
+    def _load_epidemiology_data(self) -> pd.DataFrame:
+        """
+        Load epidemiological data from a CSV/JSON file.
+        Expected columns: Disease, Incidence, Mortality, Economic_Burden, Unmet_Need.
+        If no file is provided, generate dummy data.
+        """
+        if self.epi_data_file and os.path.exists(self.epi_data_file):
+            try:
+                if self.epi_data_file.endswith('.csv'):
+                    df = pd.read_csv(self.epi_data_file)
+                elif self.epi_data_file.endswith('.json'):
+                    df = pd.read_json(self.epi_data_file)
+                else:
+                    logger.error("Unsupported epidemiology data file format.")
+                    raise ValueError("Unsupported file format.")
+                logger.info(f"Epidemiology data loaded from {self.epi_data_file}.")
+                return df
+            except Exception as e:
+                logger.error(f"Error loading epidemiology data: {e}")
+                raise e
+        else:
+            logger.warning("No epidemiology data file provided; generating dummy data.")
+            data = {
+                "Disease": ["DiseaseA", "DiseaseB", "DiseaseC", "DiseaseD", "DiseaseE", "DiseaseF"],
+                "Incidence": [0.2, 0.15, 0.1, 0.05, 0.02, 0.01],        # Fraction of population
+                "Mortality": [0.05, 0.04, 0.03, 0.02, 0.01, 0.005],       # Fraction of population
+                "Economic_Burden": [100, 80, 60, 40, 20, 10],              # Arbitrary units
+                "Unmet_Need": [0.9, 0.8, 0.7, 0.6, 0.5, 0.4]                # Scale from 0 to 1
+            }
+            df = pd.DataFrame(data)
+            return df
+
+    def _load_target_mapping(self) -> Dict[str, List[str]]:
+        """
+        Load mapping from diseases to molecular targets from a JSON file.
+        If not provided, generate dummy mapping.
+        """
+        if self.target_mapping_file and os.path.exists(self.target_mapping_file):
+            try:
+                with open(self.target_mapping_file, "r") as f:
+                    mapping = json.load(f)
+                logger.info(f"Target mapping loaded from {self.target_mapping_file}.")
+                return mapping
+            except Exception as e:
+                logger.error(f"Error loading target mapping: {e}")
+                raise e
+        else:
+            logger.warning("No target mapping file provided; generating dummy mapping.")
+            mapping = {
+                "DiseaseA": ["ProteinA1", "ProteinA2"],
+                "DiseaseB": ["ProteinB1"],
+                "DiseaseC": ["ProteinC1", "ProteinC2", "ProteinC3"],
+                "DiseaseD": ["ProteinD1"],
+                "DiseaseE": ["ProteinE1", "ProteinE2"],
+                "DiseaseF": ["ProteinF1"]
+            }
+            return mapping
+
+    def compute_composite_scores(self) -> pd.DataFrame:
+        """
+        Compute a composite score for each disease based on normalized criteria and configured weights.
+        Normalization is done via min-max scaling.
+        Returns a DataFrame with an additional column "Composite_Score".
+        """
+        df = self.epi_data.copy()
+        criteria = ["Incidence", "Mortality", "Economic_Burden", "Unmet_Need"]
+        for criterion in criteria:
+            min_val = df[criterion].min()
+            max_val = df[criterion].max()
+            if max_val - min_val > 0:
+                df[f"{criterion}_norm"] = (df[criterion] - min_val) / (max_val - min_val)
+            else:
+                df[f"{criterion}_norm"] = 0.0
+        # Compute weighted sum of normalized criteria.
+        df["Composite_Score"] = (
+            self.criteria_weights["incidence"] * df["Incidence_norm"] +
+            self.criteria_weights["mortality"] * df["Mortality_norm"] +
+            self.criteria_weights["economic_burden"] * df["Economic_Burden_norm"] +
+            self.criteria_weights["unmet_need"] * df["Unmet_Need_norm"]
+        )
+        # Depending on interpretation, lower composite scores might indicate higher priority.
+        # Here, we invert the score so that lower scores indicate higher priority.
+        df["Composite_Score"] = -df["Composite_Score"]
+        logger.info("Composite scores computed for diseases.")
+        return df
+
+    def rank_diseases(self) -> pd.DataFrame:
+        """
+        Rank diseases based on composite scores.
+        Returns the ranked DataFrame (ascending order: highest priority first).
+        """
+        df = self.compute_composite_scores()
+        ranked_df = df.sort_values(by="Composite_Score", ascending=True).reset_index(drop=True)
+        logger.info("Diseases ranked based on composite scores.")
+        return ranked_df
+
+    def map_diseases_to_targets(self, ranked_df: pd.DataFrame) -> Dict[str, List[str]]:
+        """
+        Map the top N prioritized diseases to their molecular targets using the target mapping.
+        Returns a dictionary mapping disease names to a list of targets.
+        """
+        top_diseases = ranked_df["Disease"].tolist()[:self.top_n]
+        mapping = {}
+        for disease in top_diseases:
+            mapping[disease] = self.target_mapping.get(disease, [])
+        logger.info(f"Top {self.top_n} diseases mapped to targets: {mapping}")
+        return mapping
+
+    def generate_summary_report(self) -> Dict[str, Any]:
+        """
+        Generate a comprehensive summary report including:
+          - Ranked list of diseases with composite scores.
+          - Mapping of top diseases to molecular targets.
+          - An expert-level interpretation generated via ChatGPT.
+        Returns a dictionary with the report details.
+        """
+        ranked_df = self.rank_diseases()
+        target_map = self.map_diseases_to_targets(ranked_df)
+        
+        # Build a text summary.
+        summary_text = "Disease Prioritization Summary:\n\n"
+        for idx, row in ranked_df.iterrows():
+            summary_text += f"{idx+1}. {row['Disease']} (Composite Score: {row['Composite_Score']:.3f})\n"
+        summary_text += "\nTarget Mapping for Top Diseases:\n"
+        for disease, targets in target_map.items():
+            summary_text += f"{disease}: {', '.join(targets) if targets else 'No targets available'}\n"
+        
+        # Optionally, get ChatGPT's expert interpretation.
+        try:
+            prompt = (
+                "You are a leading biomedical expert. Analyze the following disease prioritization summary "
+                "and provide a concise interpretation focusing on the most critical diseases and potential therapeutic targets:\n\n"
+                + summary_text +
+                "\n\nExpert Interpretation:"
+            )
+            response = openai.ChatCompletion.create(
+                model=self.chatgpt_model,
+                messages=[
+                    {"role": "system", "content": "You are a knowledgeable biomedical expert."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=200
+            )
+            expert_summary = response.choices[0].message["content"].strip()
+            logger.info("Expert summary generated via ChatGPT.")
+        except Exception as e:
+            logger.error(f"Error generating expert summary: {e}")
+            expert_summary = "Expert summary unavailable due to an error."
+        
+        report = {
+            "ranked_diseases": ranked_df.to_dict(orient="records"),
+            "target_mapping": target_map,
+            "expert_summary": expert_summary
+        }
+        return report
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the module.
+    config = {
+        "EPIDEMIOLOGY_DATA_FILE": None,  # Use dummy data.
+        "TARGET_MAPPING_FILE": None,     # Use dummy mapping.
+        "CRITERIA_WEIGHTS": {
+            "incidence": 0.4,
+            "mortality": 0.3,
+            "economic_burden": 0.2,
+            "unmet_need": 0.1
+        },
+        "TOP_N": 3,
+        "CHATGPT_MODEL": "gpt-4",
+        "OPENAI_API_KEY": "your_openai_api_key_here"  # Replace with your API key.
+    }
+    
+    dp_module = DiseasePrioritizationModule(config)
+    summary_report = dp_module.generate_summary_report()
+    print("Disease Prioritization & Target Selection Report:")
+    print(json.dumps(summary_report, indent=2))
