@@ -1,0 +1,261 @@
+# security_compliance_privacy_module.py
+
+import os
+import json
+import time
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, Any, List, Optional
+
+import numpy as np
+from cryptography.fernet import Fernet, InvalidToken
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "SecurityComplianceModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("SecurityComplianceModule")
+
+class SecurityComplianceModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Security, Compliance & Privacy Module.
+        
+        Config parameters include:
+          - KEY_FILE: File path to store the encryption key.
+          - AUDIT_LOG_FILE: File path for the audit log (JSON lines).
+          - ALLOWED_ROLES: List of roles authorized to access sensitive data.
+          - KEY_ROTATION_INTERVAL_DAYS: Frequency (in days) to rotate the encryption key.
+          - VULNERABILITY_SCAN_INTERVAL_DAYS: Frequency for simulated vulnerability scans.
+        """
+        self.config = config
+        self.key_file = config.get("KEY_FILE", "encryption.key")
+        self.audit_log_file = config.get("AUDIT_LOG_FILE", "audit_log.jsonl")
+        self.allowed_roles = config.get("ALLOWED_ROLES", ["admin", "security_officer"])
+        self.key_rotation_interval_days = config.get("KEY_ROTATION_INTERVAL_DAYS", 30)
+        self.vuln_scan_interval_days = config.get("VULNERABILITY_SCAN_INTERVAL_DAYS", 7)
+        self.last_key_rotation = None
+
+        # Initialize encryption key.
+        self.key = self._load_or_generate_key()
+        self.fernet = Fernet(self.key)
+
+        # Initialize audit log file if not present.
+        if not os.path.exists(self.audit_log_file):
+            with open(self.audit_log_file, "w") as f:
+                f.write("")  # Create an empty file.
+
+        logger.info("SecurityComplianceModule initialized.")
+
+    def _load_or_generate_key(self) -> bytes:
+        """
+        Load the encryption key from the key file, or generate a new one if the file does not exist.
+        Also sets the last_key_rotation timestamp.
+        """
+        if os.path.exists(self.key_file):
+            with open(self.key_file, "rb") as f:
+                key = f.read()
+            logger.info("Encryption key loaded from file.")
+        else:
+            key = Fernet.generate_key()
+            with open(self.key_file, "wb") as f:
+                f.write(key)
+            logger.info("Encryption key generated and saved.")
+        self.last_key_rotation = datetime.utcnow()
+        return key
+
+    def rotate_key(self) -> None:
+        """
+        Rotate the encryption key if the rotation interval has passed.
+        This method generates a new key, re-encrypts all stored sensitive data if needed,
+        and updates the key file and last_key_rotation timestamp.
+        For demonstration, we simulate key rotation without re-encrypting external data.
+        """
+        now = datetime.utcnow()
+        if now - self.last_key_rotation > timedelta(days=self.key_rotation_interval_days):
+            new_key = Fernet.generate_key()
+            with open(self.key_file, "wb") as f:
+                f.write(new_key)
+            self.key = new_key
+            self.fernet = Fernet(new_key)
+            self.last_key_rotation = now
+            self._audit_event("KeyRotation", {"new_key_generated": True})
+            logger.info("Encryption key rotated.")
+        else:
+            logger.debug("Key rotation not needed at this time.")
+
+    def encrypt_data(self, data: str) -> bytes:
+        """
+        Encrypt the input data (string) using Fernet symmetric encryption.
+        Returns the encrypted data as bytes.
+        """
+        encrypted = self.fernet.encrypt(data.encode("utf-8"))
+        self._audit_event("DataEncryption", {"data_length": len(data)})
+        return encrypted
+
+    def decrypt_data(self, token: bytes) -> Optional[str]:
+        """
+        Decrypt the provided token using Fernet.
+        Returns the decrypted data as a string, or None if decryption fails.
+        """
+        try:
+            decrypted = self.fernet.decrypt(token)
+            self._audit_event("DataDecryption", {"token_length": len(token)})
+            return decrypted.decode("utf-8")
+        except InvalidToken:
+            self._audit_event("DataDecryptionFailed", {"token_length": len(token)})
+            logger.error("Invalid encryption token provided for decryption.")
+            return None
+
+    def _audit_event(self, event_type: str, details: Dict[str, Any]) -> None:
+        """
+        Log an audit event with the current timestamp, event type, and additional details.
+        The audit log is appended to a file in JSON lines format.
+        """
+        event = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "event_type": event_type,
+            "details": details
+        }
+        with open(self.audit_log_file, "a") as f:
+            f.write(json.dumps(event) + "\n")
+        logger.debug(f"Audit event logged: {event_type}")
+
+    def check_access(self, user_role: str) -> bool:
+        """
+        Check if a user with the given role is allowed to access sensitive data.
+        Returns True if allowed, False otherwise.
+        """
+        allowed = user_role in self.allowed_roles
+        self._audit_event("AccessCheck", {"user_role": user_role, "access_allowed": allowed})
+        if not allowed:
+            logger.warning(f"Access denied for role: {user_role}")
+        return allowed
+
+    def generate_compliance_report(self) -> Dict[str, Any]:
+        """
+        Generate a compliance report summarizing:
+          - Audit log statistics (e.g., total events, last key rotation).
+          - Recent access attempts.
+          - Key rotation and vulnerability scan history (simulated).
+        Returns a dictionary with the compliance report.
+        """
+        # For demonstration, read the last 50 audit log entries.
+        try:
+            with open(self.audit_log_file, "r") as f:
+                lines = f.readlines()
+            recent_events = [json.loads(line) for line in lines[-50:]]
+        except Exception as e:
+            recent_events = []
+            logger.error(f"Error reading audit log: {e}")
+        
+        compliance_report = {
+            "report_generated": datetime.utcnow().isoformat(),
+            "total_audit_events": len(lines) if lines else 0,
+            "last_key_rotation": self.last_key_rotation.isoformat(),
+            "recent_audit_events": recent_events,
+            "vulnerability_scan": self.simulate_vulnerability_scan()
+        }
+        self._audit_event("ComplianceReportGenerated", {"total_events": compliance_report["total_audit_events"]})
+        logger.info("Compliance report generated.")
+        return compliance_report
+
+    def simulate_vulnerability_scan(self) -> Dict[str, Any]:
+        """
+        Simulate a vulnerability scan on the system.
+        In a production system, integrate with an actual vulnerability scanning tool.
+        Returns a dictionary with dummy vulnerability metrics.
+        """
+        # Simulated vulnerability metrics.
+        vulnerabilities_found = np.random.randint(0, 5)
+        scan_report = {
+            "scan_timestamp": datetime.utcnow().isoformat(),
+            "vulnerabilities_found": int(vulnerabilities_found),
+            "severity": "low" if vulnerabilities_found < 2 else "medium" if vulnerabilities_found < 4 else "high"
+        }
+        self._audit_event("VulnerabilityScan", scan_report)
+        logger.info("Vulnerability scan completed.")
+        return scan_report
+
+    def anonymize_patient_data(self, patient_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Pseudonymize patient data by replacing identifiable information with unique codes.
+        This simple function maps patient IDs to hash-based pseudonyms.
+        Returns a new dictionary with anonymized patient IDs.
+        """
+        anonymized = {}
+        for pid, data in patient_data.items():
+            pseudonym = f"Patient_{hash(pid) % 100000}"
+            anonymized[pseudonym] = data
+        self._audit_event("DataAnonymization", {"original_count": len(patient_data), "anonymized_count": len(anonymized)})
+        logger.info("Patient data anonymized.")
+        return anonymized
+
+    def run(self, user_role: str, sensitive_data: str) -> Dict[str, Any]:
+        """
+        Run the security compliance module on a given piece of sensitive data.
+        Checks access, encrypts the data, then decrypts it for demonstration.
+        Generates a compliance report.
+        
+        user_role: The role of the user attempting access.
+        sensitive_data: A string representing sensitive information (e.g., pipeline run details).
+        
+        Returns a dictionary with:
+          - "encrypted_data": The encrypted version of the sensitive data (base64 encoded).
+          - "decrypted_data": The decrypted data (should match original if access is allowed).
+          - "compliance_report": The generated compliance report.
+        """
+        if not self.check_access(user_role):
+            return {"error": "Access denied."}
+        
+        # Rotate key if needed.
+        self.rotate_key()
+        
+        encrypted_data = self.encrypt_data(sensitive_data)
+        decrypted_data = self.decrypt_data(encrypted_data)
+        
+        compliance_report = self.generate_compliance_report()
+        
+        output = {
+            "encrypted_data": encrypted_data.decode("utf-8"),  # Decode for display.
+            "decrypted_data": decrypted_data,
+            "compliance_report": compliance_report
+        }
+        logger.info("Security compliance and privacy operations completed successfully.")
+        return output
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the Security, Compliance & Privacy Module.
+    config = {
+        "KEY_FILE": "encryption.key",
+        "AUDIT_LOG_FILE": "audit_log.jsonl",
+        "ALLOWED_ROLES": ["admin", "security_officer"],
+        "KEY_ROTATION_INTERVAL_DAYS": 30,
+        "VULNERABILITY_SCAN_INTERVAL_DAYS": 7
+    }
+    
+    sec_module = SecurityComplianceModule(config)
+    
+    # Simulate sensitive data (e.g., a pipeline run report).
+    sensitive_data = json.dumps({
+        "run_id": 123,
+        "topic": "Brain growth and neurogenesis",
+        "results": {"docking": {"ProteinA": {"binding_affinity": -7.2}}}
+    })
+    
+    # Run the module as an authorized user.
+    output = sec_module.run("admin", sensitive_data)
+    print("Security, Compliance & Privacy Module Output:")
+    print(json.dumps(output, indent=2))
+    
+    # Demonstrate anonymizing patient data.
+    patient_data = {
+        "JohnDoe123": {"age": 45, "diagnosis": "ConditionA"},
+        "JaneSmith456": {"age": 37, "diagnosis": "ConditionB"}
+    }
+    anonymized_patients = sec_module.anonymize_patient_data(patient_data)
+    print("Anonymized Patient Data:")
+    print(json.dumps(anonymized_patients, indent=2))
