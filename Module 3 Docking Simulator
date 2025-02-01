@@ -1,0 +1,263 @@
+# docking_simulation_agent.py
+
+import logging
+import requests
+import time
+from typing import Dict, Any, List
+
+import numpy as np
+import openai
+import os
+
+# Setup logging for this module.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("DockingSimulationAgent")
+
+class DockingSimulationAgent:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Docking Simulation Agent.
+        
+        config: Dictionary containing configuration parameters such as the docking API endpoint,
+                retry settings, RL refinement parameters, caching options, and ChatGPT API key.
+        """
+        self.config = config
+        self.docking_api_endpoint = config.get("DOCKING_API_ENDPOINT", "https://api.dockingsim.com/simulate")
+        self.retry_count = config.get("RETRY_COUNT", 3)
+        self.retry_delay = config.get("RETRY_DELAY", 2)  # seconds between retries
+        self.rl_max_iterations = config.get("RL_MAX_ITERATIONS", 3)
+        self.affinity_threshold = config.get("AFFINITY_THRESHOLD", -7.0)  # lower (more negative) is better
+        self.rl_improvement_factor = config.get("RL_IMPROVEMENT_FACTOR", 0.95)  # factor to adjust parameters
+        
+        # In-memory cache for docking results (avoid redundant calls).
+        self.docking_cache: Dict[str, Dict[str, Any]] = {}
+        
+        # ChatGPT API key configuration.
+        self.openai_api_key = config.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY"))
+        if not self.openai_api_key:
+            logger.error("No OpenAI API key provided. Set OPENAI_API_KEY in config or environment.")
+            raise ValueError("Missing OpenAI API key.")
+        openai.api_key = self.openai_api_key
+
+    def _post_docking_simulation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Perform the POST request to the docking simulation API using the provided payload.
+        Implements retry logic and returns the JSON response or an error message.
+        """
+        for attempt in range(self.retry_count):
+            try:
+                logger.debug(f"Docking simulation POST attempt {attempt+1} with payload: {payload}")
+                response = requests.post(self.docking_api_endpoint, json=payload, timeout=20)
+                response.raise_for_status()
+                dock_data = response.json()
+                logger.debug(f"Docking simulation successful with response: {dock_data}")
+                return dock_data
+            except Exception as e:
+                logger.error(f"Docking simulation attempt {attempt+1} failed: {e}")
+                time.sleep(self.retry_delay)
+        error_msg = f"Failed docking simulation after {self.retry_count} attempts."
+        logger.error(error_msg)
+        return {"error": error_msg}
+
+    def _simulate_initial_parameters(self, protein: str, processed_structure: str) -> Dict[str, Any]:
+        """
+        Generate initial simulation parameters for a given protein.
+        In a real system, these parameters might include grid size, ligand conformation options, etc.
+        Here we simulate by generating a dummy payload.
+        """
+        parameters = {
+            "protein": protein,
+            "structure": processed_structure,
+            "simulation_parameters": {
+                "grid_size": 20,          # example parameter
+                "ligand_flexibility": 1,   # example parameter
+                "docking_mode": "default"
+            }
+        }
+        logger.debug(f"Initial simulation parameters for {protein}: {parameters}")
+        return parameters
+
+    def _rl_refine_docking(self, protein: str, payload: Dict[str, Any], current_affinity: float) -> Dict[str, Any]:
+        """
+        Simulate an RL-based refinement loop that adjusts docking simulation parameters.
+        If the current docking affinity is above (worse than) the threshold, refine parameters and re-run simulation.
+        Returns the best docking result obtained.
+        """
+        iteration = 0
+        best_result = {"affinity": current_affinity, "payload": payload}
+        logger.info(f"Starting RL refinement for {protein} with initial affinity {current_affinity:.3f}")
+
+        while iteration < self.rl_max_iterations and best_result["affinity"] > self.affinity_threshold:
+            iteration += 1
+            # Copy the payload and adjust simulation parameters.
+            new_payload = payload.copy()
+            sim_params = new_payload.get("simulation_parameters", {}).copy()
+            old_grid = sim_params.get("grid_size", 20)
+            new_grid = max(5, int(old_grid * self.rl_improvement_factor))
+            sim_params["grid_size"] = new_grid
+            new_payload["simulation_parameters"] = sim_params
+
+            logger.info(f"RL refinement iteration {iteration} for {protein}: adjusting grid_size from {old_grid} to {new_grid}")
+            result = self._post_docking_simulation(new_payload)
+            if "error" in result:
+                logger.error(f"RL refinement simulation error for {protein}: {result.get('error')}")
+                break
+
+            new_affinity = result.get("binding_affinity", current_affinity)
+            logger.info(f"Iteration {iteration} docking affinity for {protein}: {new_affinity:.3f}")
+
+            if new_affinity < best_result["affinity"]:
+                best_result = {"affinity": new_affinity, "payload": new_payload, "result": result}
+                logger.debug(f"New best affinity for {protein}: {new_affinity:.3f}")
+            else:
+                logger.debug(f"No improvement in iteration {iteration} for {protein}.")
+            payload = new_payload
+
+        return best_result.get("result", {"binding_affinity": current_affinity})
+
+    def reason(self, protein: str, docking_result: Dict[str, Any]) -> None:
+        """
+        Agentic reasoning: Log details about the docking result and refinement decisions.
+        This placeholder could later be replaced by an RL decision module.
+        """
+        affinity = docking_result.get("binding_affinity", None)
+        if affinity is not None:
+            logger.info(f"Agentic reasoning for {protein}: Final binding affinity = {affinity:.3f}")
+        else:
+            logger.warning(f"Agentic reasoning for {protein}: No binding affinity reported.")
+
+    def _gather_artifacts(self, protein: str) -> Dict[str, str]:
+        """
+        Simulate gathering of docking simulation artifacts:
+        - Screenshot: a placeholder path or base64-encoded image string.
+        - Data table: simulated CSV/text content.
+        - Downloaded file: simulated file content.
+        
+        In a production system, these would be generated by the docking simulation software.
+        """
+        # For demonstration, we simulate artifacts as strings.
+        artifacts = {
+            "screenshot": f"Screenshot for {protein}: [Simulated image data]",
+            "data_table": f"Protein,Parameter,Value\n{protein},grid_size,20\n{protein},ligand_flexibility,1",
+            "downloaded_file": f"Simulated file content for {protein} docking results."
+        }
+        logger.debug(f"Gathered artifacts for {protein}: {artifacts}")
+        return artifacts
+
+    def interpret_results_with_chatgpt(self, docking_results: Dict[str, Any], artifacts: Dict[str, Any]) -> str:
+        """
+        Send docking simulation results along with gathered artifacts to ChatGPT for interpretation.
+        Returns the interpretation summary as a string.
+        """
+        try:
+            # Compose a detailed prompt that includes docking results and artifacts.
+            prompt = (
+                "You are an expert computational chemist. Analyze the following docking simulation results and associated artifacts, "
+                "including screenshots, data tables, and downloaded file contents. Provide a concise interpretation and suggestions "
+                "for potential next steps in optimizing ligand binding.\n\n"
+                "Docking Results:\n"
+                f"{docking_results}\n\n"
+                "Artifacts:\n"
+                f"{artifacts}\n\n"
+                "Interpretation:"
+            )
+            logger.debug("Sending prompt to ChatGPT for interpretation.")
+            # Call the ChatGPT API using OpenAI's ChatCompletion.
+            response = openai.ChatCompletion.create(
+                model="gpt-4",  # or "gpt-3.5-turbo" if preferred
+                messages=[
+                    {"role": "system", "content": "You are a helpful expert assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=300,
+            )
+            interpretation = response.choices[0].message["content"].strip()
+            logger.info("Received interpretation from ChatGPT.")
+            return interpretation
+        except Exception as e:
+            logger.error(f"Error interpreting results with ChatGPT: {e}")
+            return "Error: Failed to interpret results via ChatGPT."
+
+    def run(self, protein_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute docking simulations for each protein based on processed structure data.
+        For each protein, the agent:
+          1. Generates initial simulation parameters.
+          2. Calls the docking simulation API with robust retry logic.
+          3. Applies an RL-inspired refinement if the binding affinity is suboptimal.
+          4. Gathers artifacts (screenshots, data tables, files) produced by the simulation.
+          5. Sends results and artifacts to ChatGPT for interpretation.
+          6. Logs agentic reasoning.
+          7. Returns a detailed dictionary of docking results, including ChatGPT interpretation.
+        """
+        docking_results = {}
+        final_interpretations = {}
+        logger.info("Starting docking simulations for proteins: " + ", ".join(protein_data.keys()))
+        for protein, data in protein_data.items():
+            processed_structure = data.get("processed_structure")
+            if not processed_structure:
+                logger.error(f"No processed structure available for {protein}; skipping docking simulation.")
+                docking_results[protein] = {"error": "No processed structure available."}
+                continue
+
+            if protein in self.docking_cache:
+                logger.debug(f"Using cached docking result for {protein}.")
+                result = self.docking_cache[protein]
+            else:
+                initial_payload = self._simulate_initial_parameters(protein, processed_structure)
+                initial_result = self._post_docking_simulation(initial_payload)
+                if "error" in initial_result:
+                    docking_results[protein] = {"error": initial_result.get("error")}
+                    continue
+
+                initial_affinity = initial_result.get("binding_affinity", 0.0)
+                logger.info(f"Initial docking affinity for {protein}: {initial_affinity:.3f}")
+
+                if initial_affinity > self.affinity_threshold:
+                    result = self._rl_refine_docking(protein, initial_payload, initial_affinity)
+                else:
+                    result = initial_result
+
+                self.docking_cache[protein] = result
+
+            self.reason(protein, result)
+            docking_results[protein] = result
+
+            # Gather artifacts for this protein.
+            artifacts = self._gather_artifacts(protein)
+            # Pass docking result and artifacts to ChatGPT for interpretation.
+            interpretation = self.interpret_results_with_chatgpt(result, artifacts)
+            final_interpretations[protein] = interpretation
+
+        logger.info("Docking simulations and ChatGPT interpretation completed.")
+        # Return a combined result including both raw simulation data and ChatGPT interpretation.
+        return {
+            "docking_results": docking_results,
+            "interpretations": final_interpretations
+        }
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    config = {
+        "DOCKING_API_ENDPOINT": "https://api.dockingsim.com/simulate",
+        "RETRY_COUNT": 3,
+        "RETRY_DELAY": 2,
+        "RL_MAX_ITERATIONS": 3,
+        "AFFINITY_THRESHOLD": -7.0,
+        "RL_IMPROVEMENT_FACTOR": 0.95,
+        "OPENAI_API_KEY": "your_openai_api_key_here"  # Replace with your actual OpenAI API key
+    }
+    agent = DockingSimulationAgent(config)
+    # Dummy protein_data from Module 2; in practice, this comes from the Protein Structure Analysis Agent.
+    dummy_protein_data = {
+        "ProteinX": {"processed_structure": "Processed(StructureData_X)"},
+        "ProteinY": {"processed_structure": "Processed(StructureData_Y)"},
+        "ProteinZ": {"processed_structure": "Processed(StructureData_Z)"}
+    }
+    output = agent.run(dummy_protein_data)
+    print("Docking Simulation and Interpretation Output:")
+    print(output)
