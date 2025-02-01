@@ -4,253 +4,402 @@ import asyncio
 import concurrent.futures
 import json
 import logging
-import time
-from typing import Dict, Any
+from datetime import datetime
+import os
 
-import numpy as np
-import openai
-from fastapi import FastAPI, HTTPException
 import uvicorn
+import openai
 
-# Import our module classes (assumed implemented as per previous modules)
-from knowledge_extraction_agent import KnowledgeExtractionAgent
-from protein_structure_analysis_agent import ProteinStructureAnalysisAgent
-from docking_simulation_agent import DockingSimulationAgent
-from generative_optimization_agent import GenerativeOptimizationAgent
-from genome_editing_agent import GenomeEditingAgent
-from advanced_feedback_continual_learning_agent_v2 import AdvancedFeedbackContinualLearningAgent
+# Import all modules
+from disease_prioritization_module import DiseasePrioritizationModule
+from target_validation_module import TargetValidationModule
+from candidate_diversification_module import CandidateDiversificationModule
+from admet_druglikeness_prediction_module import ADMETPredictionModule
+from md_simulation_module import MDSimulationModule
+from data_integration_management_module import DataManager
+from lab_automation_module import LabAutomationModule
+from regulatory_documentation_module import RegulatoryDocumentationModule
+from clinical_outcome_decision_module import ClinicalOutcomeDecisionModule
+from continuous_improvement_module import ContinuousImprovementModule
+from graph_rag_module import GraphRAGModule
+from expert_collaboration_module import ExpertCollaborationModule
+from security_compliance_privacy_module import SecurityComplianceModule
+from pubmed_interpretation_module import PubMedInterpretationModule
+from advanced_candidate_combinations_module import AdvancedPotentialCombinationsModule
+from open_collaboration_module import OpenCollaborationModule
+from admin_meta_analysis_module import AdminMetaAnalysisModule
 
-# Setup structured logging (JSON formatted)
+# Set up structured logging.
 logging.basicConfig(
     level=logging.DEBUG,
-    format='{"timestamp": "%(asctime)s", "module": "PipelineOrchestrator", "level": "%(levelname)s", "message": %(message)s}'
+    format='{"timestamp": "%(asctime)s", "module": "AdvancedPipelineOrchestrator", "level": "%(levelname)s", "message": %(message)s}'
 )
-logger = logging.getLogger("PipelineOrchestrator")
+logger = logging.getLogger("AdvancedPipelineOrchestrator")
 
-# Global configuration – replace placeholder API keys with real ones.
+# Global configuration (example values; adjust as needed)
 GLOBAL_CONFIG = {
-    "LITERATURE_API_KEY": "your_literature_api_key_here",
-    "LITERATURE_API_ENDPOINT": "https://api.example.com/search",
-    "ALPHAFOLD_API_ENDPOINT": "https://api.alphafold.org/get_structure",
-    "DOCKING_API_ENDPOINT": "https://api.dockingsim.com/simulate",
-    "MODEL_INPUT_DIM": 128,
-    "LATENT_DIM": 32,
-    "MAX_OPT_ITERATIONS": 20,
-    "LEARNING_RATE": 0.01,
-    "GUIDE_SEQ_LENGTH": 20,
-    "BATCH_SIZE": 16,
-    "FEEDBACK_LEARNING_RATE": 0.001,
-    "META_UPDATE_STRATEGY": "cosine_warm_restarts",
-    "UNCERTAINTY_WEIGHT": 1.0,
-    "CHATGPT_MODEL": "gpt-4",
-    "OPENAI_API_KEY": "your_openai_api_key_here",  # Replace with your actual API key.
-    "HISTORY_LOG": True,
-    "USE_LOOKAHEAD": True,
-    "GRAD_CLIP": 5.0,
-    "RL_MAX_ITERATIONS": 3,
-    "AFFINITY_THRESHOLD": -7.0,
-    "RL_IMPROVEMENT_FACTOR": 0.95,
-    "GC_WEIGHT": 1.0,
-    "PROPERTY_WEIGHTS": {"on_target": -1.0, "off_target": 1.0, "expression_boost": -1.0},
-    "DEVICE": "cuda"  # or "cpu"
+    # Disease Prioritization
+    "EPIDEMIOLOGY_DATA_FILE": None,
+    "TARGET_MAPPING_FILE": None,
+    "CRITERIA_WEIGHTS": {"incidence": 0.4, "mortality": 0.3, "economic_burden": 0.2, "unmet_need": 0.1},
+    "TOP_N": 3,
+    
+    # Target Validation
+    "SIMILARITY_THRESHOLD": 0.8,
+    "TARGET_TYPE": "molecule",
+    
+    # Candidate Diversification
+    "NUM_GENERATED_VARIANTS": 5,
+    "DIVERSITY_THRESHOLD": 0.3,
+    "HISTORICAL_MEMORY_FILE": "historical_candidates.json",
+    "EXPLORATION_WEIGHT": 1.0,
+    
+    # ADMET Prediction
+    "MODEL_INPUT_DIM": 6,
+    "HIDDEN_DIM": 64,
+    "DROPOUT_RATE": 0.3,
+    "NUM_MC_SAMPLES": 20,
+    "PROPERTY_WEIGHTS": {"absorption": 1.0, "distribution": 1.0, "metabolism": -1.0, "excretion": 1.0, "toxicity": -2.0},
+    
+    # MD Simulation
+    "NUM_REPLICAS": 5,
+    "SIMULATION_TIME": 10.0,
+    "TEMPERATURE": 300,
+    "MD_PARAMETERS": {"timestep": 2.0},
+    "PARALLEL_WORKERS": 4,
+    "METRIC_WEIGHTS": {"binding_free_energy": 1.0},
+    "DEVICE": "cpu",
+    
+    # Data Integration
+    "DB_URL": "sqlite:///pipeline_data.db",
+    
+    # Lab Automation
+    "EXPERIMENT_TYPES": ["binding_assay", "cytotoxicity", "expression_analysis"],
+    "BASE_EXPERIMENT_DURATION": 30,
+    "RESOURCE_AVAILABILITY": {"robot_units": 4},
+    "MAX_CONCURRENT_EXPERIMENTS": 4,
+    "SCHEDULING_ALGORITHM": "priority_based",
+    "RETRY_LIMIT": 2,
+    
+    # Regulatory Documentation
+    "DOCUMENT_TEMPLATE": None,
+    "REQUIRED_SECTIONS": ["Executive Summary", "Methodology", "Results", "Risk Analysis", "Compliance Statement", "Appendix"],
+    "COMPLIANCE_THRESHOLDS": {"risk_score": 5.0},
+    "VERSION": "1.0",
+    "ORGANIZATION": "Innovative Drug Discovery Inc.",
+    
+    # Clinical Outcome Integration
+    "UNCERTAINTY_PENALTY": 0.1,
+    "PATIENT_DATA_FILE": None,
+    
+    # Continuous Improvement
+    "HISTORY_LOG_FILE": "update_history.json",
+    "MOVING_AVERAGE_WINDOW": 10,
+    "IMPROVEMENT_THRESHOLD": 0.05,
+    "INITIAL_HYPERPARAMETERS": {"exploration_weight": 1.0, "diversity_threshold": 0.3, "learning_rate": 0.01},
+    "META_UPDATE_INTERVAL": 7,
+    
+    # Graph-RAG
+    "GRAPH_DATA_FILE": None,
+    "TOP_K": 5,
+    
+    # Expert Collaboration
+    "DB_URL_EXPERT": "sqlite:///expert_feedback.db",
+    
+    # Security & Compliance
+    "KEY_FILE": "encryption.key",
+    "AUDIT_LOG_FILE": "audit_log.jsonl",
+    "ALLOWED_ROLES": ["admin", "security_officer"],
+    "KEY_ROTATION_INTERVAL_DAYS": 30,
+    "VULNERABILITY_SCAN_INTERVAL_DAYS": 7,
+    
+    # PubMed Interpretation
+    "PUBMED_QUERY": "autoimmune disease treatment",
+    "LAST_UPDATE_FILE": "pubmed_last_update.json",
+    "MEMORY_FILE": "pubmed_memory.json",
+    "SIMILARITY_THRESHOLD": 0.8,
+    "UPDATE_INTERVAL_MINUTES": 60,
+    
+    # Advanced Candidate Combinations
+    "COMBINATION_SIZE": 3,
+    "MIN_COMBINATION_SIZE": 2,
+    "MAX_COMBINATION_SIZE": 5,
+    "MAX_COMBO_SAMPLES": 1000,
+    "EFFECT_CATEGORIES": ["anti_inflammatory", "cartilage_regeneration", "analgesic", "immune_modulation"],
+    "SYNERGY_WEIGHTS": {"anti_inflammatory": 0.4, "cartilage_regeneration": 0.3, "analgesic": 0.2, "immune_modulation": 0.1},
+    "DESIRED_PROFILE": {"anti_inflammatory": 0.9, "cartilage_regeneration": 0.8, "analgesic": 0.7, "immune_modulation": 0.6},
+    "REDUNDANCY_PENALTY": 0.1,
+    "UNCERTAINTY_PENALTY": 0.1,
+    "USE_NORMALIZATION": True,
+    "DOSAGE_BASE": 100.0,
+    "DOSAGE_MULTIPLIER": 10.0,
+    "TOTAL_DOSAGE_THRESHOLD": 300.0,
+    "INTERACTION_WEIGHT": 0.5,
+    
+    # Open Collaboration
+    "GITHUB_TOKEN": "your_github_personal_access_token_here",
+    "REPO_NAME": "your_org/your_repo",
+    "DEFAULT_BRANCH": "main",
+    "COMMIT_MESSAGE_PREFIX": "[Auto-Pipeline Update]",
+    "RELEASE_TITLE_PREFIX": "Pipeline Release",
+    
+    # Admin Meta-Analysis
+    "PARETO_METRICS": ["synergy_score", "total_dosage"],
+    "SAFE_DOSAGE_THRESHOLD": 300.0,
+    
+    # OpenAI & ChatGPT settings are provided above.
 }
 
-# Set OpenAI API key globally
+# Set global OpenAI API key
 openai.api_key = GLOBAL_CONFIG["OPENAI_API_KEY"]
 
-class PipelineOrchestrator:
+class AdvancedPipelineOrchestrator:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        logger.info(json.dumps({
-            "event": "OrchestratorInitialization",
-            "timestamp": time.ctime(),
-            "config": config
-        }))
-        # Instantiate modules
-        self.knowledge_agent = KnowledgeExtractionAgent(config)
-        self.protein_agent = ProteinStructureAnalysisAgent(config)
-        self.docking_agent = DockingSimulationAgent(config)
-        self.generative_agent = GenerativeOptimizationAgent(config)
-        self.genome_agent = GenomeEditingAgent(config)
-        self.feedback_agent = AdvancedFeedbackContinualLearningAgent(config)
-        # ThreadPoolExecutor for blocking I/O tasks (if needed)
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-
+        logger.info("Initializing Advanced Pipeline Orchestrator (Core Brain)...")
+        
+        # Instantiate all modules.
+        self.pubmed_module = PubMedInterpretationModule(config)
+        self.disease_module = DiseasePrioritizationModule(config)
+        self.target_validation_module = TargetValidationModule(config)
+        self.candidate_diversification_module = CandidateDiversificationModule(config)
+        self.admet_module = ADMETPredictionModule(config)
+        self.md_module = MDSimulationModule(config)
+        self.combination_module = AdvancedPotentialCombinationsModule(config)
+        self.clinical_module = ClinicalOutcomeDecisionModule(config)
+        self.lab_module = LabAutomationModule(config)
+        self.regulatory_module = RegulatoryDocumentationModule(config)
+        self.data_manager = DataManager(config.get("DB_URL"))
+        self.continuous_improvement_module = ContinuousImprovementModule(config)
+        self.graph_rag_module = GraphRAGModule(config)
+        self.expert_collaboration_module = ExpertCollaborationModule(config)
+        self.security_module = SecurityComplianceModule(config)
+        self.open_collaboration_module = OpenCollaborationModule(config)
+        self.admin_meta_analysis_module = AdminMetaAnalysisModule(config)
+        
+        # Executor for parallel tasks.
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+        logger.info("Advanced Pipeline Orchestrator initialized.")
+    
     async def run_pipeline(self, topic: str) -> Dict[str, Any]:
-        overall_report = {"topic": topic, "timestamp": time.ctime()}
+        overall_report = {"topic": topic, "timestamp": datetime.utcnow().isoformat()}
+        logger.info(f"Starting pipeline run for topic: {topic}")
         
-        # Step 1: Knowledge Extraction
+        # 1. PubMed Interpretation & Memorization
         try:
-            logger.info(f"Starting Knowledge Extraction for topic '{topic}'")
-            research_data = await asyncio.get_event_loop().run_in_executor(
-                self.executor, self.knowledge_agent.run, topic
-            )
-            overall_report["research_data"] = research_data
+            pubmed_report = self.pubmed_module.run_update(topic)
+            overall_report["pubmed_interpretation"] = pubmed_report
         except Exception as e:
-            logger.error(json.dumps({"event": "KnowledgeExtractionError", "error": str(e)}))
-            overall_report["research_data_error"] = str(e)
-            research_data = {}
+            overall_report["pubmed_interpretation_error"] = str(e)
+            logger.error(f"Error in PubMed Module: {e}")
         
-        # Step 2: Protein Structure Analysis
+        # 2. Disease Prioritization & Target Selection
         try:
-            logger.info("Starting Protein Structure Analysis")
-            protein_data = await asyncio.get_event_loop().run_in_executor(
-                self.executor, self.protein_agent.run, research_data
-            )
-            overall_report["protein_data"] = protein_data
+            disease_report = self.disease_module.generate_summary_report()
+            overall_report["disease_prioritization"] = disease_report
         except Exception as e:
-            logger.error(json.dumps({"event": "ProteinAnalysisError", "error": str(e)}))
-            overall_report["protein_data_error"] = str(e)
-            protein_data = {}
+            overall_report["disease_prioritization_error"] = str(e)
+            logger.error(f"Error in Disease Prioritization: {e}")
         
-        # Step 3: Docking Simulation (parallelize over proteins)
+        # 3. Target Validation & Novelty Filtering
         try:
-            logger.info("Starting Docking Simulation")
-            docking_results = await self._run_module_parallel(self.docking_agent.run, protein_data)
-            overall_report["docking_results"] = docking_results
+            dummy_candidate_targets = {"Candidate_1": "CCO", "Candidate_2": "CCCC", "Candidate_3": "CCN", "Candidate_4": "CCOC", "Candidate_5": "CCCCO"}
+            target_validation_report = self.target_validation_module.run(dummy_candidate_targets)
+            overall_report["target_validation"] = target_validation_report
         except Exception as e:
-            logger.error(json.dumps({"event": "DockingSimulationError", "error": str(e)}))
-            overall_report["docking_results_error"] = str(e)
-            docking_results = {}
+            overall_report["target_validation_error"] = str(e)
+            logger.error(f"Error in Target Validation: {e}")
         
-        # Step 4: Generative Optimization (parallelize over proteins)
+        # 4. Candidate Diversification & Exploration
         try:
-            logger.info("Starting Generative Optimization")
-            optimized_candidates = await self._run_module_parallel(self.generative_agent.run, docking_results)
-            overall_report["optimized_candidates"] = optimized_candidates
+            diversification_report = self.candidate_diversification_module.run(dummy_candidate_targets)
+            overall_report["candidate_diversification"] = diversification_report
         except Exception as e:
-            logger.error(json.dumps({"event": "GenerativeOptimizationError", "error": str(e)}))
-            overall_report["optimized_candidates_error"] = str(e)
-            optimized_candidates = {}
+            overall_report["candidate_diversification_error"] = str(e)
+            logger.error(f"Error in Candidate Diversification: {e}")
         
-        # Step 5: Genome Editing Design (parallelize over proteins)
+        # 5. ADMET & Drug-Likeness Prediction
         try:
-            logger.info("Starting Genome Editing Design")
-            genome_editing_design = await self._run_module_parallel(self.genome_agent.run, optimized_candidates)
-            overall_report["genome_editing_design"] = genome_editing_design
+            diversified_candidates = {}
+            for cid, info in overall_report.get("candidate_diversification", {}).get("diversification_report", {}).items():
+                diversified_candidates[cid] = info["diversified_candidates"][0]
+            admet_predictions = {}
+            for cid, smiles in diversified_candidates.items():
+                admet_predictions[cid] = self.admet_module.predict_admet(smiles)
+            overall_report["admet_predictions"] = admet_predictions
         except Exception as e:
-            logger.error(json.dumps({"event": "GenomeEditingError", "error": str(e)}))
-            overall_report["genome_editing_design_error"] = str(e)
-            genome_editing_design = {}
+            overall_report["admet_predictions_error"] = str(e)
+            logger.error(f"Error in ADMET Prediction: {e}")
         
-        # Step 6: Feedback & Continual Learning Integration
+        # 6. Molecular Dynamics Simulation
         try:
-            logger.info("Starting Feedback Integration")
-            # In a real system, feedback_data would be sourced from experiments, expert reviews, etc.
-            dummy_ground_truth = np.random.rand(self.config.get("BATCH_SIZE", 16), 3).astype(np.float32)
-            dummy_predictions = {
-                "property_predictor": np.random.rand(self.config.get("BATCH_SIZE", 16), 3).astype(np.float32)
+            dummy_complex_structures = {"Candidate_1": {"dummy_structure": "StructureData_1"},
+                                        "Candidate_2": {"dummy_structure": "StructureData_2"},
+                                        "Candidate_3": {"dummy_structure": "StructureData_3"}}
+            md_results = self.md_module.run(dummy_complex_structures)
+            overall_report["md_simulation"] = md_results
+        except Exception as e:
+            overall_report["md_simulation_error"] = str(e)
+            logger.error(f"Error in MD Simulation: {e}")
+        
+        # 7. Advanced Combination Therapy Optimization
+        try:
+            # For demonstration, simulate candidate predictions with effect vectors and uncertainties.
+            candidate_predictions = {
+                "Candidate_1": {
+                    "effects": {"anti_inflammatory": 0.85, "cartilage_regeneration": 0.60, "analgesic": 0.70, "immune_modulation": 0.65},
+                    "uncertainty": {"anti_inflammatory": 0.05, "cartilage_regeneration": 0.03, "analgesic": 0.04, "immune_modulation": 0.06}
+                },
+                "Candidate_2": {
+                    "effects": {"anti_inflammatory": 0.80, "cartilage_regeneration": 0.75, "analgesic": 0.65, "immune_modulation": 0.70},
+                    "uncertainty": {"anti_inflammatory": 0.06, "cartilage_regeneration": 0.04, "analgesic": 0.05, "immune_modulation": 0.05}
+                },
+                "Candidate_3": {
+                    "effects": {"anti_inflammatory": 0.90, "cartilage_regeneration": 0.55, "analgesic": 0.80, "immune_modulation": 0.60},
+                    "uncertainty": {"anti_inflammatory": 0.04, "cartilage_regeneration": 0.05, "analgesic": 0.03, "immune_modulation": 0.07}
+                },
+                "Candidate_4": {
+                    "effects": {"anti_inflammatory": 0.70, "cartilage_regeneration": 0.80, "analgesic": 0.60, "immune_modulation": 0.75},
+                    "uncertainty": {"anti_inflammatory": 0.07, "cartilage_regeneration": 0.06, "analgesic": 0.04, "immune_modulation": 0.06}
+                },
+                "Candidate_5": {
+                    "effects": {"anti_inflammatory": 0.75, "cartilage_regeneration": 0.70, "analgesic": 0.75, "immune_modulation": 0.68},
+                    "uncertainty": {"anti_inflammatory": 0.05, "cartilage_regeneration": 0.05, "analgesic": 0.05, "immune_modulation": 0.05}
+                },
+                "Candidate_6": {
+                    "effects": {"anti_inflammatory": 0.88, "cartilage_regeneration": 0.65, "analgesic": 0.68, "immune_modulation": 0.72},
+                    "uncertainty": {"anti_inflammatory": 0.04, "cartilage_regeneration": 0.06, "analgesic": 0.05, "immune_modulation": 0.06}
+                }
             }
-            dummy_uncertainties = {
-                "property_predictor": np.random.uniform(0.8, 1.2, size=(self.config.get("BATCH_SIZE", 16),)).astype(np.float32)
-            }
-            feedback_data = {
-                "ground_truth": dummy_ground_truth,
-                "predictions": dummy_predictions,
-                "uncertainties": dummy_uncertainties
-            }
-            feedback_report = await asyncio.get_event_loop().run_in_executor(
-                self.executor, self.feedback_agent.run, feedback_data
-            )
-            overall_report["feedback_report"] = feedback_report
+            combination_report = self.combination_module.run(candidate_predictions)
+            overall_report["combination_therapy"] = combination_report
         except Exception as e:
-            logger.error(json.dumps({"event": "FeedbackIntegrationError", "error": str(e)}))
-            overall_report["feedback_report_error"] = str(e)
+            overall_report["combination_therapy_error"] = str(e)
+            logger.error(f"Error in Combination Therapy Optimization: {e}")
         
-        # Step 7: Final Summary and ChatGPT Analysis (asynchronously)
+        # 8. Clinical Outcome Integration & Decision Support
         try:
-            final_summary = {
-                "research_data": overall_report.get("research_data", {}),
-                "protein_data": overall_report.get("protein_data", {}),
-                "docking_results": overall_report.get("docking_results", {}),
-                "optimized_candidates": overall_report.get("optimized_candidates", {}),
-                "genome_editing_design": overall_report.get("genome_editing_design", {}),
-                "feedback_report": overall_report.get("feedback_report", {})
+            dummy_candidate_predictions = {
+                "Candidate_1": {
+                    "disease": "DiseaseA",
+                    "efficacy": {"mean": 0.85, "std": 0.05},
+                    "risk": {"mean": 0.25, "std": 0.03},
+                    "admet": {"composite_score": -7.0, "std": 0.4}
+                },
+                "Candidate_2": {
+                    "disease": "DiseaseB",
+                    "efficacy": {"mean": 0.75, "std": 0.06},
+                    "risk": {"mean": 0.20, "std": 0.02},
+                    "admet": {"composite_score": -6.8, "std": 0.35}
+                },
+                "Candidate_3": {
+                    "disease": "DiseaseC",
+                    "efficacy": {"mean": 0.80, "std": 0.04},
+                    "risk": {"mean": 0.30, "std": 0.05},
+                    "admet": {"composite_score": -7.2, "std": 0.45}
+                }
             }
-            summary_str = json.dumps(final_summary, indent=2)
-            prompt = (
-                "You are a world-class expert in AI-driven drug discovery. Review the following comprehensive pipeline "
-                "report and provide a strategic summary including key findings, potential improvements, and recommendations "
-                "for optimizing the pipeline further:\n\n" + summary_str + "\n\nYour analysis:"
-            )
-            chatgpt_analysis = await self._get_chatgpt_analysis(prompt)
-            overall_report["final_analysis"] = chatgpt_analysis
+            clinical_outcomes = self.clinical_module.run(dummy_candidate_predictions, {})
+            overall_report["clinical_outcomes"] = clinical_outcomes
         except Exception as e:
-            logger.error(json.dumps({"event": "FinalAnalysisError", "error": str(e)}))
-            overall_report["final_analysis_error"] = str(e)
+            overall_report["clinical_outcomes_error"] = str(e)
+            logger.error(f"Error in Clinical Outcome Integration: {e}")
+        
+        # 9. Laboratory Automation & Experimental Planning
+        try:
+            dummy_candidate_data = diversified_candidates if "diversified_candidates" in locals() else {}
+            lab_schedule = self.lab_module.schedule_experiments(dummy_candidate_data)
+            lab_experiment_results = await asyncio.get_event_loop().run_in_executor(
+                self.executor, self.lab_module.run_all_experiments, lab_schedule
+            )
+            overall_report["lab_experiments"] = lab_experiment_results
+        except Exception as e:
+            overall_report["lab_experiments_error"] = str(e)
+            logger.error(f"Error in Lab Automation: {e}")
+        
+        # 10. Regulatory & Documentation Generation
+        try:
+            regulatory_doc = self.regulatory_module.generate_documentation(overall_report)
+            overall_report["regulatory_documentation"] = regulatory_doc
+        except Exception as e:
+            overall_report["regulatory_documentation_error"] = str(e)
+            logger.error(f"Error in Regulatory Documentation: {e}")
+        
+        # 11. Data Integration & Management
+        try:
+            run_metadata = {"topic": topic, "timestamp": overall_report["timestamp"], "metadata": {"version": "v1.0"}}
+            run_id = self.data_manager.store_pipeline_run(run_metadata, overall_report)
+            overall_report["stored_run_id"] = run_id
+            logger.info(f"Stored pipeline run with ID: {run_id}")
+        except Exception as e:
+            overall_report["data_integration_error"] = str(e)
+            logger.error(f"Error in Data Integration: {e}")
+        
+        # 12. Continuous Improvement & Self-Assessment
+        try:
+            ci_report = self.continuous_improvement_module.run()
+            overall_report["continuous_improvement"] = ci_report
+        except Exception as e:
+            overall_report["continuous_improvement_error"] = str(e)
+            logger.error(f"Error in Continuous Improvement: {e}")
+        
+        # 13. Graph-RAG for Interactive Data Exploration
+        try:
+            sample_query = "What are the most promising multi-target treatment combinations for traumatic brain injury?"
+            graph_response = self.graph_rag_module.query_graph(sample_query)
+            overall_report["graph_rag_query"] = graph_response
+        except Exception as e:
+            overall_report["graph_rag_error"] = str(e)
+            logger.error(f"Error in Graph-RAG Module: {e}")
+        
+        # 14. Expert Collaboration & Communication
+        try:
+            expert_feedback = self.expert_collaboration_module.get_consensus()
+            overall_report["expert_collaboration"] = expert_feedback
+        except Exception as e:
+            overall_report["expert_collaboration_error"] = str(e)
+            logger.error(f"Error in Expert Collaboration: {e}")
+        
+        # 15. Security, Compliance & Privacy
+        try:
+            sensitive_info = json.dumps({"run_id": overall_report.get("stored_run_id", "N/A"), "topic": topic})
+            security_output = self.security_module.run("admin", sensitive_info)
+            overall_report["security_compliance"] = security_output
+        except Exception as e:
+            overall_report["security_compliance_error"] = str(e)
+            logger.error(f"Error in Security Module: {e}")
+        
+        # 16. Open Collaboration & Repository Integration (Admin use)
+        try:
+            repo_status = self.open_collaboration_module.run()
+            overall_report["open_collaboration"] = repo_status
+        except Exception as e:
+            overall_report["open_collaboration_error"] = str(e)
+            logger.error(f"Error in Open Collaboration Module: {e}")
+        
+        # 17. Admin Meta-Analysis (Periodic Strategic Review)
+        try:
+            admin_meta = self.admin_meta_analysis_module.run()
+            overall_report["admin_meta_analysis"] = admin_meta
+        except Exception as e:
+            overall_report["admin_meta_analysis_error"] = str(e)
+            logger.error(f"Error in Admin Meta-Analysis Module: {e}")
         
         overall_report["pipeline_status"] = "Completed"
-        logger.info(json.dumps({"event": "PipelineCompleted", "timestamp": time.ctime()}))
+        logger.info("Advanced Pipeline Orchestrator run completed successfully.")
         return overall_report
 
-    async def _run_module_parallel(self, module_run_func, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Run a module's run() method in parallel over each key in the input_data dictionary.
-        Returns a dictionary mapping each key to its module output.
-        """
-        loop = asyncio.get_event_loop()
-        tasks = []
-        # Assume input_data is a dictionary where keys are protein names.
-        for key, value in input_data.items():
-            # Each task is run in the thread pool.
-            tasks.append(loop.run_in_executor(self.executor, module_run_func, {key: value}))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        combined_results = {}
-        for key, result in zip(input_data.keys(), results):
-            if isinstance(result, Exception):
-                logger.error(json.dumps({"event": "ModuleParallelError", "key": key, "error": str(result)}))
-                combined_results[key] = {"error": str(result)}
-            else:
-                # Each module_run_func returns a dict with one key.
-                combined_results.update(result)
-        return combined_results
-
-    async def _get_chatgpt_analysis(self, prompt: str) -> str:
-        """
-        Asynchronously send the prompt to ChatGPT and return its analysis.
-        """
-        try:
-            loop = asyncio.get_event_loop()
-            # Run synchronous ChatGPT API call in an executor.
-            response = await loop.run_in_executor(
-                self.executor,
-                lambda: openai.ChatCompletion.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "You are a knowledgeable and innovative expert in AI-driven drug discovery."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.2,
-                    max_tokens=300,
-                )
-            )
-            analysis = response.choices[0].message["content"].strip()
-            logger.info(json.dumps({"event": "ChatGPTAnalysisReceived", "analysis": analysis}))
-            return analysis
-        except Exception as e:
-            logger.error(json.dumps({"event": "ChatGPTAnalysisError", "error": str(e)}))
-            return "Error: Failed to obtain analysis from ChatGPT."
-
-# FastAPI app for external access.
-app = FastAPI(title="Revolutionary Drug Discovery Pipeline Orchestrator")
-
-# Instantiate the orchestrator.
-pipeline_orchestrator = PipelineOrchestrator(GLOBAL_CONFIG)
-
-@app.get("/run_pipeline")
-async def run_pipeline(topic: str):
-    try:
-        report = await pipeline_orchestrator.run_pipeline(topic)
-        return report
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# For standalone running.
+# For running as a standalone server with web interface (optional)
 if __name__ == "__main__":
-    # Run the pipeline orchestrator with a sample topic.
-    sample_topic = "Brain growth and neurogenesis"
-    final_report = asyncio.run(pipeline_orchestrator.run_pipeline(sample_topic))
-    print("Final Pipeline Report:")
-    print(json.dumps(final_report, indent=2))
-    # Uncomment to run FastAPI:
-    # uvicorn.run(app, host="0.0.0.0", port=8000)
+    # To run the pipeline orchestrator as a web server, you can integrate this with FastAPI.
+    # For demonstration, we will run a simple asynchronous pipeline run.
+    async def main():
+        orchestrator = AdvancedPipelineOrchestrator(GLOBAL_CONFIG)
+        topic = "Multi-target treatment for traumatic brain injury"
+        final_report = await orchestrator.run_pipeline(topic)
+        print("Final Integrated Pipeline Report:")
+        print(json.dumps(final_report, indent=2))
+    
+    asyncio.run(main())
+    # Alternatively, use uvicorn to serve a web API.
+    # uvicorn.run("advanced_pipeline_orchestrator:app", host="0.0.0.0", port=8000, reload=True)
