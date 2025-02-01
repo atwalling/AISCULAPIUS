@@ -1,0 +1,232 @@
+# visualization_dashboard_module.py
+
+import os
+import json
+import logging
+import datetime
+import pandas as pd
+import numpy as np
+
+import dash
+from dash import dcc, html, dash_table, callback_context
+from dash.dependencies import Input, Output, State
+import dash_bootstrap_components as dbc
+import plotly.express as px
+
+# Setup logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "VisualizationDashboard", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("VisualizationDashboard")
+
+# Define a function to load pipeline run data.
+def load_pipeline_data(file_path: str = "pipeline_runs_export.json") -> pd.DataFrame:
+    """
+    Load pipeline run data from a JSON file.
+    Returns a Pandas DataFrame summarizing each run.
+    For demonstration, if the file does not exist, dummy data is generated.
+    """
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            data = json.load(f)
+        # Flatten data: For each run, extract run_id, topic, timestamp, and key metrics from module outputs.
+        records = []
+        for run in data:
+            run_id = run.get("id", "N/A")
+            topic = run.get("topic", "N/A")
+            timestamp = run.get("timestamp", "N/A")
+            # For example, extract mean binding free energy from docking results.
+            docking = run.get("docking_results", {})
+            if docking:
+                # Compute average binding free energy over all candidates.
+                binding_vals = [v.get("mean_binding_free_energy", np.nan) for v in docking.values() if isinstance(v, dict)]
+                avg_binding = np.nanmean(binding_vals) if binding_vals else np.nan
+            else:
+                avg_binding = np.nan
+            records.append({
+                "run_id": run_id,
+                "topic": topic,
+                "timestamp": timestamp,
+                "avg_binding_free_energy": avg_binding
+            })
+        df = pd.DataFrame(records)
+        logger.info(f"Loaded {len(df)} pipeline runs from {file_path}.")
+        return df
+    else:
+        # Generate dummy data if file not found.
+        logger.warning(f"{file_path} not found; generating dummy pipeline data.")
+        dummy_data = []
+        for i in range(10):
+            dummy_data.append({
+                "run_id": i+1,
+                "topic": f"Topic_{i+1}",
+                "timestamp": (datetime.datetime.utcnow() - datetime.timedelta(days=i)).isoformat(),
+                "avg_binding_free_energy": np.random.uniform(-8.0, -6.0)
+            })
+        df = pd.DataFrame(dummy_data)
+        return df
+
+# Load the pipeline data.
+pipeline_df = load_pipeline_data()
+
+# Initialize the Dash app.
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.title = "Drug Discovery Pipeline Dashboard"
+
+# Define the dashboard layout with multiple tabs.
+app.layout = dbc.Container([
+    dbc.Row([
+        dbc.Col(html.H1("Drug Discovery Pipeline Dashboard"), width=12)
+    ], className="my-2"),
+    dbc.Tabs([
+        dbc.Tab(label="Overview", tab_id="tab-overview"),
+        dbc.Tab(label="Candidate Analysis", tab_id="tab-candidate"),
+        dbc.Tab(label="MD Simulation Metrics", tab_id="tab-md"),
+        dbc.Tab(label="Clinical Translation", tab_id="tab-clinical"),
+        dbc.Tab(label="Pipeline History", tab_id="tab-history")
+    ], id="tabs", active_tab="tab-overview"),
+    html.Div(id="tab-content", className="p-4"),
+    # Interval for real-time refresh (e.g., every 60 seconds).
+    dcc.Interval(id="interval-component", interval=60*1000, n_intervals=0)
+], fluid=True)
+
+# Helper functions to generate content for each tab.
+
+def render_overview_tab():
+    """
+    Overview tab: Display summary statistics of the pipeline runs.
+    """
+    total_runs = len(pipeline_df)
+    avg_binding = pipeline_df["avg_binding_free_energy"].mean()
+    content = dbc.Card([
+        dbc.CardHeader("Overview"),
+        dbc.CardBody([
+            html.P(f"Total Pipeline Runs: {total_runs}", className="card-text"),
+            html.P(f"Average Binding Free Energy (kcal/mol): {avg_binding:.2f}", className="card-text")
+        ])
+    ])
+    return content
+
+def render_candidate_tab():
+    """
+    Candidate Analysis tab: Display an interactive scatter plot of candidate scores.
+    For demonstration, we simulate candidate data.
+    """
+    # Simulate candidate data.
+    candidate_data = pd.DataFrame({
+        "Candidate": [f"Candidate_{i+1}" for i in range(20)],
+        "Composite Score": np.random.uniform(-10, -6, 20),
+        "Binding Free Energy": np.random.uniform(-8, -6, 20)
+    })
+    fig = px.scatter(candidate_data, x="Binding Free Energy", y="Composite Score",
+                     hover_name="Candidate", title="Candidate Performance",
+                     labels={"Binding Free Energy": "Binding Free Energy (kcal/mol)",
+                             "Composite Score": "Composite Score"})
+    content = dbc.Card([
+        dbc.CardHeader("Candidate Analysis"),
+        dbc.CardBody([
+            dcc.Graph(figure=fig)
+        ])
+    ])
+    return content
+
+def render_md_tab():
+    """
+    MD Simulation Metrics tab: Display histograms of key MD metrics.
+    For demonstration, we simulate MD simulation data.
+    """
+    # Simulate MD simulation metrics.
+    md_data = pd.DataFrame({
+        "RMSD": np.random.normal(2.0, 0.2, 100),
+        "Binding Free Energy": np.random.normal(-7.0, 0.5, 100),
+        "Interaction Energy": np.random.normal(-50.0, 5.0, 100)
+    })
+    fig_rmsd = px.histogram(md_data, x="RMSD", nbins=20, title="RMSD Distribution")
+    fig_binding = px.histogram(md_data, x="Binding Free Energy", nbins=20, title="Binding Free Energy Distribution")
+    content = dbc.Card([
+        dbc.CardHeader("Molecular Dynamics Simulation Metrics"),
+        dbc.CardBody([
+            dbc.Row([
+                dbc.Col(dcc.Graph(figure=fig_rmsd), width=6),
+                dbc.Col(dcc.Graph(figure=fig_binding), width=6)
+            ])
+        ])
+    ])
+    return content
+
+def render_clinical_tab():
+    """
+    Clinical Translation tab: Display predicted clinical outcomes.
+    For demonstration, we simulate clinical prediction data.
+    """
+    # Simulate clinical prediction data.
+    clinical_data = pd.DataFrame({
+        "Candidate": [f"Candidate_{i+1}" for i in range(10)],
+        "Efficacy (mean)": np.random.uniform(0.5, 1.5, 10),
+        "Efficacy (std)": np.random.uniform(0.05, 0.15, 10),
+        "Risk (mean)": np.random.uniform(0.0, 0.5, 10),
+        "Risk (std)": np.random.uniform(0.01, 0.05, 10)
+    })
+    fig = px.bar(clinical_data, x="Candidate", y="Efficacy (mean)",
+                 error_y="Efficacy (std)", title="Predicted Efficacy Across Candidates",
+                 labels={"Efficacy (mean)": "Efficacy (mean)", "Candidate": "Candidate"})
+    content = dbc.Card([
+        dbc.CardHeader("Clinical Translation & Patient Stratification"),
+        dbc.CardBody([
+            dcc.Graph(figure=fig)
+        ])
+    ])
+    return content
+
+def render_history_tab():
+    """
+    Pipeline History tab: Display a table of past pipeline runs.
+    Data is loaded from the Data Integration & Management Module export.
+    """
+    # For demonstration, use the pipeline_df from our Data Integration Module.
+    if pipeline_df.empty:
+        df = pd.DataFrame(columns=["run_id", "topic", "timestamp", "avg_binding_free_energy"])
+    else:
+        df = pipeline_df.copy()
+    table = dash_table.DataTable(
+        id='history-table',
+        columns=[{"name": i, "id": i} for i in df.columns],
+        data=df.to_dict("records"),
+        page_size=10,
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'left'},
+        style_header={'fontWeight': 'bold'}
+    )
+    content = dbc.Card([
+        dbc.CardHeader("Pipeline History"),
+        dbc.CardBody([table])
+    ])
+    return content
+
+# Callback to update tab content based on active tab and refresh interval.
+@app.callback(
+    Output("tab-content", "children"),
+    [Input("tabs", "active_tab"),
+     Input("interval-component", "n_intervals")]
+)
+def render_tab_content(active_tab, n_intervals):
+    # Optionally reload pipeline data on interval.
+    global pipeline_df
+    pipeline_df = load_pipeline_data()
+    if active_tab == "tab-overview":
+        return render_overview_tab()
+    elif active_tab == "tab-candidate":
+        return render_candidate_tab()
+    elif active_tab == "tab-md":
+        return render_md_tab()
+    elif active_tab == "tab-clinical":
+        return render_clinical_tab()
+    elif active_tab == "tab-history":
+        return render_history_tab()
+    else:
+        return html.P("This tab is not yet implemented.")
+
+if __name__ == "__main__":
+    # Run the dashboard on port 8050.
+    app.run_server(debug=True)
