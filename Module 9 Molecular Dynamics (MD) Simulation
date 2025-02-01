@@ -1,0 +1,199 @@
+# md_simulation_module.py
+
+import logging
+import json
+import time
+from typing import Dict, Any, List
+import numpy as np
+import concurrent.futures
+
+# Setup structured JSON logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "MDSimulationModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("MDSimulationModule")
+
+
+class MDSimulationModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Molecular Dynamics (MD) Simulation Module.
+        
+        config: Dictionary of configuration parameters including:
+          - NUM_REPLICAS: Number of replica simulations per candidate complex.
+          - SIMULATION_TIME: Simulation time in nanoseconds (dummy value for simulation).
+          - TEMPERATURE: Simulation temperature in Kelvin.
+          - MD_PARAMETERS: Dictionary of additional MD parameters (e.g., pressure, timestep).
+          - DEVICE: For future GPU acceleration, e.g., "cuda" or "cpu" (dummy here).
+          - PARALLEL_WORKERS: Number of parallel workers to run replica simulations.
+          - METRIC_WEIGHTS: Weights for composing a final composite score (e.g., binding free energy).
+        """
+        self.config = config
+        self.num_replicas = config.get("NUM_REPLICAS", 5)
+        self.simulation_time = config.get("SIMULATION_TIME", 10.0)  # ns (dummy)
+        self.temperature = config.get("TEMPERATURE", 300)  # Kelvin
+        self.md_parameters = config.get("MD_PARAMETERS", {"timestep": 2.0})  # fs (dummy)
+        self.device = config.get("DEVICE", "cpu")
+        self.parallel_workers = config.get("PARALLEL_WORKERS", 4)
+        self.metric_weights = config.get("METRIC_WEIGHTS", {"binding_free_energy": 1.0})
+        logger.info(json.dumps({
+            "event": "MDSimulationModuleInitialized",
+            "num_replicas": self.num_replicas,
+            "simulation_time_ns": self.simulation_time,
+            "temperature_K": self.temperature,
+            "md_parameters": self.md_parameters,
+            "device": self.device,
+            "parallel_workers": self.parallel_workers
+        }))
+        # Initialize a thread pool executor for parallel simulation replicas.
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel_workers)
+
+    def _simulate_single_md_run(self, complex_structure: Any, replica_id: int) -> Dict[str, Any]:
+        """
+        Simulate a single MD simulation run (replica) for the given protein-ligand complex.
+        
+        In a production system, this would call an MD engine (e.g., OpenMM) with the complex structure.
+        Here we simulate the MD run by generating random metrics with trends that mimic convergence.
+        
+        Returns a dictionary containing:
+          - "rmsd": Root-mean-square deviation (Å)
+          - "binding_free_energy": Simulated binding free energy (kcal/mol) [more negative is better]
+          - "interaction_energy": Average interaction energy (kcal/mol)
+          - "replica_id": The ID of this replica run.
+          - "simulation_time": Simulated time in ns.
+        """
+        # Simulate a delay to mimic computation.
+        time.sleep(np.random.uniform(0.1, 0.3))
+        # Generate dummy metrics. In a real simulation, these would be computed from the trajectory.
+        rmsd = np.random.normal(loc=2.0, scale=0.2)  # Å
+        binding_free_energy = np.random.normal(loc=-7.0, scale=0.5)  # kcal/mol
+        interaction_energy = np.random.normal(loc=-50.0, scale=5.0)  # kcal/mol
+        result = {
+            "replica_id": replica_id,
+            "rmsd": rmsd,
+            "binding_free_energy": binding_free_energy,
+            "interaction_energy": interaction_energy,
+            "simulation_time": self.simulation_time
+        }
+        logger.debug(json.dumps({
+            "event": "MDReplicaCompleted",
+            "replica_id": replica_id,
+            "metrics": result
+        }))
+        return result
+
+    def run_simulation_for_candidate(self, candidate_id: str, complex_structure: Any) -> Dict[str, Any]:
+        """
+        Run multiple MD simulation replicas for a given candidate protein-ligand complex.
+        
+        candidate_id: A unique identifier for the candidate (e.g., protein name or complex ID).
+        complex_structure: The input structure data (could be a file path, PDB data, or a dictionary).
+        
+        Returns a dictionary with aggregated metrics:
+          - "mean_rmsd", "std_rmsd"
+          - "mean_binding_free_energy", "std_binding_free_energy"
+          - "mean_interaction_energy", "std_interaction_energy"
+          - "replica_results": List of individual replica outputs.
+          - "composite_score": A weighted composite score (e.g., binding free energy weighted).
+        """
+        logger.info(json.dumps({
+            "event": "MDRunStart",
+            "candidate_id": candidate_id,
+            "message": f"Running {self.num_replicas} replicas for candidate {candidate_id}"
+        }))
+        futures = []
+        for rep in range(1, self.num_replicas + 1):
+            futures.append(self.executor.submit(self._simulate_single_md_run, complex_structure, rep))
+        # Wait for all replicas to complete.
+        replica_results = []
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                result = future.result()
+                replica_results.append(result)
+            except Exception as e:
+                logger.error(json.dumps({
+                    "event": "MDReplicaError",
+                    "error": str(e)
+                }))
+        # Aggregate metrics.
+        binding_energies = np.array([res["binding_free_energy"] for res in replica_results])
+        rmsd_values = np.array([res["rmsd"] for res in replica_results])
+        interaction_energies = np.array([res["interaction_energy"] for res in replica_results])
+        aggregated = {
+            "mean_rmsd": float(np.mean(rmsd_values)),
+            "std_rmsd": float(np.std(rmsd_values)),
+            "mean_binding_free_energy": float(np.mean(binding_energies)),
+            "std_binding_free_energy": float(np.std(binding_energies)),
+            "mean_interaction_energy": float(np.mean(interaction_energies)),
+            "std_interaction_energy": float(np.std(interaction_energies)),
+            "replica_results": replica_results
+        }
+        # Compute a composite score; for example, weighted binding free energy.
+        composite_score = self.metric_weights.get("binding_free_energy", 1.0) * np.mean(binding_energies)
+        aggregated["composite_score"] = composite_score
+        logger.info(json.dumps({
+            "event": "MDAggregatedResults",
+            "candidate_id": candidate_id,
+            "aggregated_metrics": aggregated
+        }))
+        return {candidate_id: aggregated}
+
+    def run(self, simulation_input: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Run MD simulations for all candidate complexes.
+        
+        simulation_input: Dictionary mapping candidate IDs to complex structure data.
+        
+        Returns a dictionary mapping each candidate ID to its aggregated MD simulation results.
+        """
+        overall_results = {}
+        logger.info(json.dumps({
+            "event": "MDRunAllStart",
+            "message": "Starting MD simulations for all candidates",
+            "num_candidates": len(simulation_input)
+        }))
+        for candidate_id, complex_structure in simulation_input.items():
+            try:
+                result = self.run_simulation_for_candidate(candidate_id, complex_structure)
+                overall_results.update(result)
+            except Exception as e:
+                logger.error(json.dumps({
+                    "event": "MDSimulationError",
+                    "candidate_id": candidate_id,
+                    "error": str(e)
+                }))
+                overall_results[candidate_id] = {"error": str(e)}
+        logger.info(json.dumps({
+            "event": "MDRunAllComplete",
+            "overall_results": overall_results
+        }))
+        return overall_results
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the MD Simulation Module.
+    config = {
+        "NUM_REPLICAS": 5,
+        "SIMULATION_TIME": 10.0,  # nanoseconds
+        "TEMPERATURE": 300,       # Kelvin
+        "MD_PARAMETERS": {"timestep": 2.0},  # fs
+        "PARALLEL_WORKERS": 4,
+        "METRIC_WEIGHTS": {"binding_free_energy": 1.0},
+        "DEVICE": "cpu"  # Change to "cuda" if GPU is available.
+    }
+    
+    md_module = MDSimulationModule(config)
+    
+    # Dummy simulation input: dictionary mapping candidate IDs to dummy "complex_structure" data.
+    # In a real system, complex_structure could be a PDB file path or a detailed structure dictionary.
+    simulation_input = {
+        "ProteinX_complex": {"dummy_structure": "StructureData_X"},
+        "ProteinY_complex": {"dummy_structure": "StructureData_Y"},
+        "ProteinZ_complex": {"dummy_structure": "StructureData_Z"}
+    }
+    
+    md_results = md_module.run(simulation_input)
+    print("MD Simulation Results:")
+    print(json.dumps(md_results, indent=2))
