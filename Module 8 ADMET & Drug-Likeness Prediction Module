@@ -1,0 +1,189 @@
+# admet_druglikeness_prediction_module.py
+
+import logging
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Attempt to import RDKit for descriptor calculations.
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors, Crippen, Lipinski, rdMolDescriptors
+except ImportError:
+    Chem = None
+    Descriptors = None
+    Crippen = None
+    Lipinski = None
+    rdMolDescriptors = None
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "ADMETPredictionModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("ADMETPredictionModule")
+
+
+def compute_molecular_descriptors(smiles: str) -> np.ndarray:
+    """
+    Compute a set of molecular descriptors from the SMILES string.
+    Uses RDKit if available; otherwise, returns a dummy descriptor vector.
+    Descriptors include molecular weight, LogP, TPSA, number of rotatable bonds, and more.
+    Returns a NumPy array of descriptors.
+    """
+    if Chem is None:
+        logger.warning("RDKit not available; returning dummy descriptors.")
+        return np.random.rand(10).astype(np.float32)
+    
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            logger.error("Invalid SMILES string provided.")
+            raise ValueError("Invalid SMILES")
+        # Compute descriptors:
+        mw = Descriptors.MolWt(mol)
+        logp = Crippen.MolLogP(mol)
+        tpsa = rdMolDescriptors.CalcTPSA(mol)
+        rot_bonds = Lipinski.NumRotatableBonds(mol)
+        hbd = Lipinski.NumHDonors(mol)
+        hba = Lipinski.NumHAcceptors(mol)
+        # More descriptors can be added here.
+        descriptor_vector = np.array([mw, logp, tpsa, rot_bonds, hbd, hba], dtype=np.float32)
+        logger.debug(f"Computed descriptors for SMILES '{smiles}': {descriptor_vector.tolist()}")
+        return descriptor_vector
+    except Exception as e:
+        logger.error(f"Error computing descriptors: {e}")
+        # Return a fallback descriptor vector.
+        return np.zeros(6, dtype=np.float32)
+
+
+class ADMETModel(nn.Module):
+    """
+    A neural network model to predict ADMET properties from molecular descriptors.
+    The model architecture can be replaced with any state-of-the-art model (e.g., a graph neural network).
+    Here we implement a simple feedforward network with dropout for uncertainty estimation.
+    Output dimensions: [Absorption, Distribution, Metabolism, Excretion, Toxicity]
+    """
+    def __init__(self, input_dim: int, hidden_dim: int = 64, output_dim: int = 5, dropout_rate: float = 0.3):
+        super(ADMETModel, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc3 = nn.Linear(hidden_dim // 2, output_dim)
+    
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+class ADMETPredictionModule:
+    def __init__(self, config: dict):
+        """
+        Initialize the ADMET & Drug-Likeness Prediction Module.
+        
+        config: A dictionary containing configuration parameters:
+          - MODEL_INPUT_DIM: Dimensionality of molecular descriptor vector.
+          - HIDDEN_DIM: Hidden layer size for the neural network.
+          - DROPOUT_RATE: Dropout rate for Monte Carlo dropout.
+          - NUM_MC_SAMPLES: Number of Monte Carlo dropout samples for uncertainty estimation.
+          - PROPERTY_WEIGHTS: Weights for each predicted property in the composite drug-likeness score.
+            Example: {"absorption": 1.0, "distribution": 1.0, "metabolism": -1.0, "excretion": 1.0, "toxicity": -2.0}
+          - DEVICE: "cuda" or "cpu"
+        """
+        self.config = config
+        self.input_dim = config.get("MODEL_INPUT_DIM", 6)  # Default: 6 descriptors computed above.
+        self.hidden_dim = config.get("HIDDEN_DIM", 64)
+        self.dropout_rate = config.get("DROPOUT_RATE", 0.3)
+        self.num_mc_samples = config.get("NUM_MC_SAMPLES", 20)
+        self.property_weights = config.get("PROPERTY_WEIGHTS", {
+            "absorption": 1.0,
+            "distribution": 1.0,
+            "metabolism": -1.0,
+            "excretion": 1.0,
+            "toxicity": -2.0
+        })
+        self.device = torch.device(config.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+        # Initialize the ADMET prediction model.
+        self.model = ADMETModel(self.input_dim, self.hidden_dim, output_dim=5, dropout_rate=self.dropout_rate).to(self.device)
+        # In a production system, load pre-trained weights here.
+        self.model.eval()
+        logger.info("ADMETPredictionModule initialized.")
+
+    def predict_admet(self, smiles: str) -> Dict[str, Any]:
+        """
+        Predict ADMET properties and a composite drug-likeness score for the given candidate molecule (SMILES).
+        Uses Monte Carlo dropout for uncertainty estimation.
+        
+        Returns a dictionary with:
+          - "admet_properties": Dictionary with individual property predictions (mean and std for each).
+          - "composite_score": A weighted composite score.
+          - "descriptors": The molecular descriptor vector.
+        """
+        # Step 1: Compute molecular descriptors.
+        descriptors = compute_molecular_descriptors(smiles)
+        descriptors_tensor = torch.tensor(descriptors, dtype=torch.float32, device=self.device)
+        # Normalize descriptors if needed; here we assume they are roughly on comparable scales.
+        
+        # Step 2: Monte Carlo dropout sampling.
+        predictions = []
+        self.model.train()  # Enable dropout for MC sampling.
+        with torch.no_grad():
+            for i in range(self.num_mc_samples):
+                output = self.model(descriptors_tensor)
+                predictions.append(output.cpu().numpy())
+        predictions = np.array(predictions)  # Shape: [NUM_MC_SAMPLES, 5]
+        # Compute mean and standard deviation.
+        mean_preds = np.mean(predictions, axis=0)
+        std_preds = np.std(predictions, axis=0)
+        property_names = ["absorption", "distribution", "metabolism", "excretion", "toxicity"]
+        admet_properties = {name: {"mean": float(mean), "std": float(std)}
+                            for name, mean, std in zip(property_names, mean_preds, std_preds)}
+        logger.debug(f"Predicted ADMET properties for '{smiles}': {admet_properties}")
+        
+        # Step 3: Compute composite drug-likeness score.
+        # The composite score is computed as a weighted sum of the predicted properties.
+        composite_score = 0.0
+        for name in property_names:
+            weight = self.property_weights.get(name, 1.0)
+            composite_score += weight * mean_preds[property_names.index(name)]
+        logger.info(f"Composite drug-likeness score for '{smiles}': {composite_score:.4f}")
+        
+        result = {
+            "admet_properties": admet_properties,
+            "composite_score": composite_score,
+            "descriptors": descriptors.tolist()
+        }
+        return result
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the ADMET module.
+    config = {
+        "MODEL_INPUT_DIM": 6,
+        "HIDDEN_DIM": 64,
+        "DROPOUT_RATE": 0.3,
+        "NUM_MC_SAMPLES": 20,
+        "PROPERTY_WEIGHTS": {
+            "absorption": 1.0,
+            "distribution": 1.0,
+            "metabolism": -1.0,
+            "excretion": 1.0,
+            "toxicity": -2.0
+        },
+        "DEVICE": "cuda"  # or "cpu"
+    }
+    
+    admet_module = ADMETPredictionModule(config)
+    
+    # Example SMILES string for a candidate molecule (this is an example; replace with a real SMILES)
+    test_smiles = "CC(=O)Oc1ccccc1C(=O)O"  # Aspirin
+    prediction_output = admet_module.predict_admet(test_smiles)
+    
+    print("ADMET & Drug-Likeness Prediction Output:")
+    print(json.dumps(prediction_output, indent=2))
