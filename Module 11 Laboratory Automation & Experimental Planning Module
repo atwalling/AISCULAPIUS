@@ -1,0 +1,236 @@
+# lab_automation_module.py
+
+import asyncio
+import concurrent.futures
+import json
+import logging
+import random
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Any, List
+
+import numpy as np
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "LabAutomationModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("LabAutomationModule")
+
+
+class LabAutomationModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Laboratory Automation & Experimental Planning Module.
+        
+        Config parameters include:
+          - EXPERIMENT_TYPES: List of experiment types (e.g., "binding_assay", "cytotoxicity", "expression_analysis").
+          - BASE_EXPERIMENT_DURATION: Base duration (in minutes) for each experiment type.
+          - RESOURCE_AVAILABILITY: Dict indicating available lab resources (e.g., number of robotic units).
+          - MAX_CONCURRENT_EXPERIMENTS: Maximum experiments that can run concurrently.
+          - SCHEDULING_ALGORITHM: Name or type of scheduling algorithm (e.g., "priority_based", "round_robin").
+          - RETRY_LIMIT: Maximum number of retries for failed experiments.
+          - DEVICE: (Optional) For future integration with lab hardware control systems.
+        """
+        self.config = config
+        self.experiment_types = config.get("EXPERIMENT_TYPES", ["binding_assay", "cytotoxicity", "expression_analysis"])
+        self.base_duration = config.get("BASE_EXPERIMENT_DURATION", 30)  # minutes
+        self.resources = config.get("RESOURCE_AVAILABILITY", {"robot_units": 4})
+        self.max_concurrent = config.get("MAX_CONCURRENT_EXPERIMENTS", 4)
+        self.scheduling_algorithm = config.get("SCHEDULING_ALGORITHM", "priority_based")
+        self.retry_limit = config.get("RETRY_LIMIT", 2)
+        self.device = config.get("DEVICE", "cpu")
+        # Use an executor for blocking operations if needed.
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_concurrent)
+        logger.info(json.dumps({
+            "event": "LabAutomationModuleInitialized",
+            "experiment_types": self.experiment_types,
+            "base_duration_min": self.base_duration,
+            "resources": self.resources,
+            "max_concurrent_experiments": self.max_concurrent,
+            "scheduling_algorithm": self.scheduling_algorithm,
+            "retry_limit": self.retry_limit
+        }))
+    
+    def schedule_experiments(self, candidate_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate an experimental schedule for candidate molecules.
+        
+        candidate_data: Dictionary mapping candidate IDs to candidate details (e.g., predicted properties, optimization outputs).
+        
+        Returns a schedule dictionary mapping candidate IDs to a list of scheduled experiments.
+        Each scheduled experiment includes:
+          - "experiment_type": Type of experiment.
+          - "scheduled_start": ISO-formatted start time.
+          - "expected_duration": Duration in minutes.
+          - "priority": A score based on candidate ranking (lower score = higher priority).
+        """
+        schedule = {}
+        current_time = datetime.utcnow()
+        for candidate_id, details in candidate_data.items():
+            # For demonstration, compute a priority based on the composite score from previous modules (if available).
+            composite_score = details.get("composite_score", random.uniform(-10, 0))
+            # Lower composite scores (more negative) imply better candidates; we convert to a priority.
+            priority = -composite_score
+            experiments = []
+            # Schedule one experiment for each type.
+            for exp_type in self.experiment_types:
+                # Adjust expected duration slightly based on experiment type.
+                duration = self.base_duration + random.randint(-5, 5)
+                scheduled_start = (current_time + timedelta(minutes=random.randint(0, 10))).isoformat()
+                experiments.append({
+                    "experiment_type": exp_type,
+                    "scheduled_start": scheduled_start,
+                    "expected_duration": duration,
+                    "priority": priority
+                })
+            schedule[candidate_id] = experiments
+        logger.info(json.dumps({
+            "event": "ExperimentsScheduled",
+            "schedule": schedule
+        }))
+        return schedule
+
+    async def run_experiment(self, candidate_id: str, experiment: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Simulate running a single laboratory experiment.
+        
+        candidate_id: The candidate molecule identifier.
+        experiment: Dictionary with experiment details (type, start time, duration, etc.).
+        
+        Returns a dictionary with simulated experimental outcomes:
+          - "measured_binding_affinity" (for binding assays)
+          - "cytotoxicity" (for cytotoxicity assays)
+          - "expression_level" (for expression analysis)
+          - "success": Boolean indicating whether the experiment succeeded.
+          - "duration_actual": Actual duration in minutes.
+        """
+        logger.info(json.dumps({
+            "event": "ExperimentStarted",
+            "candidate_id": candidate_id,
+            "experiment": experiment
+        }))
+        # Simulate waiting until the scheduled start time (for demonstration, we use a short delay).
+        await asyncio.sleep(random.uniform(0.1, 0.3))
+        # Simulate experiment execution.
+        base_duration = experiment.get("expected_duration", self.base_duration)
+        # Simulate variable execution time.
+        actual_duration = base_duration + random.uniform(-2, 2)
+        await asyncio.sleep(actual_duration * 0.01)  # Scale down sleep time for simulation.
+        # Generate simulated outcomes based on experiment type.
+        exp_type = experiment.get("experiment_type")
+        outcome = {"candidate_id": candidate_id, "experiment_type": exp_type, "duration_actual": actual_duration}
+        if exp_type == "binding_assay":
+            outcome["measured_binding_affinity"] = np.random.normal(loc=-7.0, scale=0.3)
+        elif exp_type == "cytotoxicity":
+            outcome["cytotoxicity"] = np.random.uniform(0, 10)  # Arbitrary toxicity score.
+        elif exp_type == "expression_analysis":
+            outcome["expression_level"] = np.random.uniform(1.0, 2.0)  # Fold-change expression.
+        # Simulate success/failure (10% chance of failure).
+        outcome["success"] = random.random() > 0.1
+        logger.info(json.dumps({
+            "event": "ExperimentCompleted",
+            "candidate_id": candidate_id,
+            "experiment": experiment,
+            "outcome": outcome
+        }))
+        return outcome
+
+    async def run_all_experiments(self, schedule: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute all scheduled experiments in parallel.
+        
+        schedule: Dictionary mapping candidate IDs to a list of scheduled experiments.
+        
+        Returns a dictionary mapping candidate IDs to a list of experimental outcomes.
+        """
+        overall_results = {}
+        tasks = []
+        for candidate_id, experiments in schedule.items():
+            candidate_tasks = []
+            for exp in experiments:
+                task = asyncio.create_task(self.run_experiment(candidate_id, exp))
+                candidate_tasks.append(task)
+            overall_results[candidate_id] = await asyncio.gather(*candidate_tasks, return_exceptions=True)
+        logger.info(json.dumps({
+            "event": "AllExperimentsCompleted",
+            "results": overall_results
+        }))
+        return overall_results
+
+    def update_experimental_plan(self, experiment_results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze experimental outcomes and update the experimental plan accordingly.
+        
+        For candidates with experiments that failed or produced suboptimal results,
+        reschedule additional experiments with adjusted parameters.
+        
+        Returns an updated schedule (dictionary mapping candidate IDs to new experiments).
+        """
+        updated_schedule = {}
+        current_time = datetime.utcnow()
+        for candidate_id, outcomes in experiment_results.items():
+            new_experiments = []
+            for outcome in outcomes:
+                # Check if outcome is an Exception.
+                if isinstance(outcome, Exception):
+                    logger.error(f"Error in experiment for candidate {candidate_id}: {outcome}")
+                    continue
+                # If experiment failed or results are suboptimal, schedule a re-run.
+                if not outcome.get("success", False):
+                    # Reschedule the same experiment type with a slight delay.
+                    new_start = (current_time + timedelta(minutes=random.randint(5, 10))).isoformat()
+                    new_experiments.append({
+                        "experiment_type": outcome.get("experiment_type"),
+                        "scheduled_start": new_start,
+                        "expected_duration": self.base_duration,  # Keep the same duration.
+                        "priority": 1.0  # Increase priority for re-run.
+                    })
+            if new_experiments:
+                updated_schedule[candidate_id] = new_experiments
+        logger.info(json.dumps({
+            "event": "ExperimentalPlanUpdated",
+            "updated_schedule": updated_schedule
+        }))
+        return updated_schedule
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the Lab Automation Module.
+    config = {
+        "EXPERIMENT_TYPES": ["binding_assay", "cytotoxicity", "expression_analysis"],
+        "BASE_EXPERIMENT_DURATION": 30,  # minutes
+        "RESOURCE_AVAILABILITY": {"robot_units": 4},
+        "MAX_CONCURRENT_EXPERIMENTS": 4,
+        "SCHEDULING_ALGORITHM": "priority_based",
+        "RETRY_LIMIT": 2,
+        "DEVICE": "cpu"
+    }
+    
+    lab_module = LabAutomationModule(config)
+    
+    # Simulated candidate data from previous modules.
+    # For each candidate, we assume some details (e.g., composite score) that may influence scheduling.
+    candidate_data = {
+        "Candidate_A": {"composite_score": -7.5},
+        "Candidate_B": {"composite_score": -6.8},
+        "Candidate_C": {"composite_score": -7.2}
+    }
+    
+    # Step 1: Schedule experiments.
+    schedule = lab_module.schedule_experiments(candidate_data)
+    print("Experimental Schedule:")
+    print(json.dumps(schedule, indent=2))
+    
+    # Step 2: Run experiments (asynchronously).
+    loop = asyncio.get_event_loop()
+    experiment_results = loop.run_until_complete(lab_module.run_all_experiments(schedule))
+    print("Experimental Results:")
+    print(json.dumps(experiment_results, indent=2))
+    
+    # Step 3: Update experimental plan based on results.
+    updated_schedule = lab_module.update_experimental_plan(experiment_results)
+    print("Updated Experimental Schedule:")
+    print(json.dumps(updated_schedule, indent=2))
