@@ -1,0 +1,327 @@
+# advanced_generative_optimization_agent.py
+
+import logging
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from typing import Dict, Any
+
+# Attempt to import RDKit for SMILES validation; if unavailable, define dummy functions.
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors
+except ImportError:
+    class Chem:
+        @staticmethod
+        def MolFromSmiles(smiles):
+            return smiles
+    class Descriptors:
+        @staticmethod
+        def MolWt(mol):
+            return 300.0
+
+# Setup detailed logging.
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("AdvancedGenerativeOptimizationAgent")
+
+
+# =========================
+# Advanced Generative Model (VAE)
+# =========================
+class AdvancedGenerativeModel(nn.Module):
+    """
+    A variational autoencoder (VAE) to generate candidate molecule embeddings.
+    This dummy model consists of an encoder that produces latent means and log variances
+    and a decoder that reconstructs an input feature vector representing molecular characteristics.
+    """
+    def __init__(self, input_dim: int, latent_dim: int):
+        super(AdvancedGenerativeModel, self).__init__()
+        # Encoder network.
+        self.encoder_fc1 = nn.Linear(input_dim, 256)
+        self.encoder_fc2_mu = nn.Linear(256, latent_dim)
+        self.encoder_fc2_logvar = nn.Linear(256, latent_dim)
+        # Decoder network.
+        self.decoder_fc1 = nn.Linear(latent_dim, 256)
+        self.decoder_fc2 = nn.Linear(256, input_dim)
+    
+    def encode(self, x: torch.Tensor):
+        h = F.relu(self.encoder_fc1(x))
+        mu = self.encoder_fc2_mu(h)
+        logvar = self.encoder_fc2_logvar(h)
+        return mu, logvar
+    
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z: torch.Tensor):
+        h = F.relu(self.decoder_fc1(z))
+        recon_x = self.decoder_fc2(h)
+        return recon_x
+    
+    def forward(self, x: torch.Tensor):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        recon_x = self.decode(z)
+        return recon_x, mu, logvar, z
+
+
+# =========================
+# Differentiable Multi-Objective Property Predictor
+# =========================
+class PropertyPredictor(nn.Module):
+    """
+    A neural network that predicts molecular properties from a latent vector.
+    Predicted properties include:
+      - Binding affinity (BA): lower values indicate stronger binding.
+      - Synthetic accessibility (SA): higher values are preferable.
+      - Toxicity (T): lower values are better.
+    """
+    def __init__(self, latent_dim: int):
+        super(PropertyPredictor, self).__init__()
+        self.fc1 = nn.Linear(latent_dim, 64)
+        self.fc2 = nn.Linear(64, 3)  # Output: [BA, SA, T]
+    
+    def forward(self, z: torch.Tensor):
+        h = F.relu(self.fc1(z))
+        props = self.fc2(h)
+        return props  # Raw outputs; composite objective defined separately.
+
+
+# =========================
+# Utility: Decode Latent to SMILES
+# =========================
+def decode_smiles_from_latent(latent_vector: np.ndarray) -> str:
+    """
+    Dummy decoder that converts a latent vector into a candidate SMILES string.
+    In practice, this would be replaced with a trained decoder (e.g., using RDKit and a generative model).
+    Here, we simulate by converting a deterministic function of the latent vector into a string.
+    """
+    seed = int(np.sum(latent_vector) * 1000) % 1000000
+    smiles_chars = list("CNOPSFClBrI=#$()123456789")
+    length = 20
+    candidate = "".join([smiles_chars[(seed + i) % len(smiles_chars)] for i in range(length)])
+    return candidate
+
+
+# =========================
+# Utility: Evaluate Molecule Properties (with RDKit if available)
+# =========================
+def evaluate_molecule(smiles: str) -> Dict[str, float]:
+    """
+    Evaluate the candidate molecule. For demonstration:
+      - Molecular weight via RDKit (or dummy constant).
+      - Synthetic accessibility and toxicity are simulated.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return {"mol_weight": float('inf'), "synthetic_accessibility": 0.0, "toxicity": 10.0}
+    mol_weight = Descriptors.MolWt(mol)
+    synthetic_accessibility = np.random.uniform(0, 1)  # Dummy value; higher is better.
+    toxicity = np.random.uniform(0, 10)  # Dummy value; lower is better.
+    return {"mol_weight": mol_weight, "synthetic_accessibility": synthetic_accessibility, "toxicity": toxicity}
+
+
+# =========================
+# Advanced Generative Optimization Agent
+# =========================
+class AdvancedGenerativeOptimizationAgent:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the advanced generative optimization agent.
+        
+        Config parameters include:
+          - MODEL_INPUT_DIM: Dimensionality of input feature vector from docking results.
+          - LATENT_DIM: Dimensionality of the latent space.
+          - MAX_OPT_ITERATIONS: Maximum iterations for latent space optimization.
+          - LEARNING_RATE: Learning rate for the latent optimization.
+          - PROPERTY_WEIGHTS: Weights for each property in the composite objective.
+            Composite Objective: Objective = BA + T - (alpha * SA)
+          - DEVICE: 'cuda' or 'cpu'
+        """
+        self.config = config
+        self.input_dim = config.get("MODEL_INPUT_DIM", 128)
+        self.latent_dim = config.get("LATENT_DIM", 32)
+        self.max_opt_iterations = config.get("MAX_OPT_ITERATIONS", 20)
+        self.learning_rate = config.get("LEARNING_RATE", 0.01)
+        # Composite objective weights.
+        self.property_weights = config.get("PROPERTY_WEIGHTS", {"BA": 1.0, "SA": 1.0, "T": 1.0})
+        self.device = torch.device(config.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+        
+        # Initialize the advanced generative model (a dummy VAE).
+        self.gen_model = AdvancedGenerativeModel(self.input_dim, self.latent_dim).to(self.device)
+        self.gen_model.eval()
+        
+        # Initialize the property predictor.
+        self.prop_predictor = PropertyPredictor(self.latent_dim).to(self.device)
+        self.prop_predictor.eval()
+        
+        logger.info("Advanced Generative Optimization Agent initialized with cutting-edge models.")
+
+    def _generate_initial_candidate(self, docking_result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate an initial candidate molecule from docking result features.
+        For demonstration, create a dummy input vector based on binding affinity.
+        """
+        binding_affinity = docking_result.get("binding_affinity", 0.0)
+        base_feature = np.full(self.input_dim, fill_value=abs(binding_affinity) + 1.0, dtype=np.float32)
+        input_tensor = torch.from_numpy(base_feature).to(self.device)
+        with torch.no_grad():
+            _, _, _, latent = self.gen_model(input_tensor)
+        latent_np = latent.cpu().numpy()
+        candidate_smiles = decode_smiles_from_latent(latent_np)
+        latent_tensor = torch.from_numpy(latent_np).to(self.device)
+        with torch.no_grad():
+            properties = self.prop_predictor(latent_tensor).cpu().numpy().flatten()
+        candidate = {
+            "smiles": candidate_smiles,
+            "latent": latent_np,
+            "predicted_properties": {
+                "binding_affinity": properties[0],
+                "synthetic_accessibility": properties[1],
+                "toxicity": properties[2]
+            }
+        }
+        logger.debug(f"Initial candidate generated: {candidate}")
+        return candidate
+
+    def _composite_objective(self, properties: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Compute the composite objective from predicted properties.
+        Objective = BA + T - (alpha * SA)
+        Lower objective values are better.
+        """
+        BA = properties.get("binding_affinity", torch.tensor(0.0, device=self.device))
+        SA = properties.get("synthetic_accessibility", torch.tensor(0.0, device=self.device))
+        T = properties.get("toxicity", torch.tensor(0.0, device=self.device))
+        alpha = self.property_weights.get("SA", 1.0)
+        return BA + T - alpha * SA
+
+    def _optimize_latent(self, initial_latent: np.ndarray) -> np.ndarray:
+        """
+        Optimize the latent vector using gradient descent to minimize the composite objective.
+        This optimization is performed in a differentiable manner using the property predictor.
+        """
+        latent = torch.tensor(initial_latent, dtype=torch.float32, device=self.device, requires_grad=True)
+        optimizer = optim.Adam([latent], lr=self.learning_rate)
+        best_score = float('inf')
+        best_latent = latent.detach().clone()
+        
+        for iteration in range(self.max_opt_iterations):
+            optimizer.zero_grad()
+            properties_tensor = self.prop_predictor(latent)
+            # Split predicted properties.
+            BA, SA, T = properties_tensor[0], properties_tensor[1], properties_tensor[2]
+            predicted_props = {"binding_affinity": BA, "synthetic_accessibility": SA, "toxicity": T}
+            objective = self._composite_objective(predicted_props)
+            objective.backward()
+            optimizer.step()
+            current_score = objective.item()
+            logger.debug(f"Latent optimization iteration {iteration+1}: composite objective = {current_score:.4f}")
+            if current_score < best_score:
+                best_score = current_score
+                best_latent = latent.detach().clone()
+        logger.info(f"Latent optimization complete. Best objective: {best_score:.4f}")
+        return best_latent.cpu().numpy()
+
+    def _validate_candidate(self, candidate_smiles: str) -> bool:
+        """
+        Validate the candidate SMILES string using RDKit.
+        Returns True if valid, False otherwise.
+        """
+        mol = Chem.MolFromSmiles(candidate_smiles)
+        if mol is None:
+            logger.warning(f"Candidate SMILES '{candidate_smiles}' is invalid.")
+            return False
+        logger.debug(f"Candidate SMILES '{candidate_smiles}' is valid.")
+        return True
+
+    def _evaluate_candidate(self, latent: np.ndarray) -> Dict[str, Any]:
+        """
+        Decode the latent vector into a candidate SMILES string,
+        predict properties, validate the candidate, and perform additional evaluation.
+        """
+        candidate_smiles = decode_smiles_from_latent(latent)
+        latent_tensor = torch.from_numpy(latent).to(self.device)
+        with torch.no_grad():
+            properties = self.prop_predictor(latent_tensor).cpu().numpy().flatten()
+        predicted_properties = {
+            "binding_affinity": properties[0],
+            "synthetic_accessibility": properties[1],
+            "toxicity": properties[2]
+        }
+        valid = self._validate_candidate(candidate_smiles)
+        extra_evaluation = evaluate_molecule(candidate_smiles)
+        evaluation = {
+            "smiles": candidate_smiles,
+            "predicted_properties": predicted_properties,
+            "extra_metrics": extra_evaluation,
+            "valid": valid
+        }
+        return evaluation
+
+    def reason(self, protein: str, candidate: Dict[str, Any]) -> None:
+        """
+        Log detailed reasoning behind the optimized candidate.
+        This step provides transparency and feeds insights to the core brain.
+        """
+        logger.info(f"Optimized candidate for {protein}: {candidate['smiles']}")
+        logger.info(f"Predicted properties: {candidate['predicted_properties']}")
+        logger.info(f"Extra evaluation metrics: {candidate['extra_metrics']}")
+        return
+
+    def run(self, docking_results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        For each protein in the docking results, generate and optimize candidate molecules.
+        The workflow is:
+          1. Generate an initial candidate using docking result features.
+          2. Optimize the candidate's latent vector via gradient-based optimization.
+          3. Decode and evaluate the optimized candidate.
+          4. Validate the candidate and log agentic reasoning.
+        Returns a dictionary mapping each protein to its optimized candidate details.
+        """
+        optimized_candidates = {}
+        logger.info("Starting advanced generative optimization for proteins: " + ", ".join(docking_results.keys()))
+        for protein, result in docking_results.items():
+            if "error" in result:
+                logger.error(f"Skipping candidate generation for {protein} due to error: {result.get('error')}")
+                optimized_candidates[protein] = {"error": result.get("error")}
+                continue
+            
+            # Step 1: Generate an initial candidate.
+            initial_candidate = self._generate_initial_candidate(result)
+            initial_latent = initial_candidate["latent"]
+            # Step 2: Optimize the latent representation.
+            optimized_latent = self._optimize_latent(initial_latent)
+            # Step 3: Evaluate the candidate from the optimized latent.
+            evaluation = self._evaluate_candidate(optimized_latent)
+            # Agentic reasoning.
+            self.reason(protein, evaluation)
+            optimized_candidates[protein] = evaluation
+        
+        logger.info("Advanced generative optimization completed.")
+        return optimized_candidates
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    config = {
+        "MODEL_INPUT_DIM": 128,
+        "LATENT_DIM": 32,
+        "MAX_OPT_ITERATIONS": 20,
+        "LEARNING_RATE": 0.01,
+        "PROPERTY_WEIGHTS": {"BA": 1.0, "SA": 1.0, "T": 1.0},
+        "DEVICE": "cuda"  # or "cpu"
+    }
+    agent = AdvancedGenerativeOptimizationAgent(config)
+    # Dummy docking results from Module 3; in practice, these would be obtained from docking simulations.
+    dummy_docking_results = {
+        "ProteinX": {"binding_affinity": -6.5},
+        "ProteinY": {"binding_affinity": -7.2},
+        "ProteinZ": {"binding_affinity": -6.8}
+    }
+    optimization_output = agent.run(dummy_docking_results)
+    print("Advanced Generative Optimization Output:")
+    print(optimization_output)
