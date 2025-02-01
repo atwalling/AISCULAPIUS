@@ -1,0 +1,227 @@
+# knowledge_extraction_agent.py
+
+import logging
+import requests
+import time
+from typing import Dict, Any, List
+
+import numpy as np
+from transformers import pipeline, AutoTokenizer, AutoModelForTokenClassification
+from sentence_transformers import SentenceTransformer, util
+
+# Setup logging for this module
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("KnowledgeExtractionAgent")
+
+class KnowledgeExtractionAgent:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Knowledge Extraction Agent.
+        
+        config: Dictionary containing configuration parameters such as API endpoints,
+                API keys, thresholds for filtering, and storage details.
+        """
+        self.config = config
+        self.api_key = config.get("LITERATURE_API_KEY", "your_api_key_here")
+        self.api_endpoint = config.get("LITERATURE_API_ENDPOINT", "https://api.example.com/search")
+        self.similarity_threshold = config.get("SIMILARITY_THRESHOLD", 0.6)
+        self.retry_count = config.get("RETRY_COUNT", 3)
+        self.retry_delay = config.get("RETRY_DELAY", 2)  # seconds
+        
+        # Initialize the Hugging Face transformer-based NER pipeline.
+        # For biomedical NER, one might choose a model like "dmis-lab/biobert-base-cased-v1.1"
+        try:
+            self.ner_pipeline = pipeline(
+                "ner",
+                model="dmis-lab/biobert-base-cased-v1.1",
+                tokenizer="dmis-lab/biobert-base-cased-v1.1",
+                aggregation_strategy="simple"  # Groups together tokens from the same entity.
+            )
+            logger.info("Initialized NER pipeline successfully.")
+        except Exception as e:
+            logger.error(f"Error initializing NER pipeline: {e}")
+            raise e
+
+        # Initialize a SentenceTransformer model to embed texts and compute similarity.
+        try:
+            self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+            logger.info("Initialized SentenceTransformer for text embeddings.")
+        except Exception as e:
+            logger.error(f"Error initializing SentenceTransformer: {e}")
+            raise e
+
+        # Placeholder for persistent storage initialization (e.g., a database or cache)
+        self.storage = None
+
+    def fetch_literature(self, query: str) -> Dict[str, Any]:
+        """
+        Synchronously fetch literature data for the given query.
+        This function implements retries and error handling.
+        Returns a dictionary (expected to contain an "abstracts" key with a list of texts).
+        """
+        params = {"query": query, "api_key": self.api_key}
+        for attempt in range(self.retry_count):
+            try:
+                logger.debug(f"Fetching literature (attempt {attempt+1}) for query: '{query}'")
+                response = requests.get(self.api_endpoint, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                logger.debug("Literature data retrieved successfully.")
+                return data
+            except Exception as e:
+                logger.error(f"Attempt {attempt+1} failed: {e}")
+                time.sleep(self.retry_delay)
+        # After retries, return an empty result with an error flag.
+        logger.error("All literature fetch attempts failed.")
+        return {"abstracts": [], "error": "Failed to fetch literature data after multiple attempts."}
+
+    def filter_abstracts(self, abstracts: List[str], query: str) -> List[str]:
+        """
+        Use the SentenceTransformer to compute similarity between the query and each abstract.
+        Filter out abstracts with similarity scores below a set threshold.
+        """
+        if not abstracts:
+            logger.warning("No abstracts provided for filtering.")
+            return []
+        try:
+            logger.debug("Computing embeddings for query and abstracts.")
+            query_embedding = self.embedding_model.encode(query, convert_to_tensor=True)
+            abstract_embeddings = self.embedding_model.encode(abstracts, convert_to_tensor=True)
+            # Compute cosine similarities between the query and each abstract.
+            cosine_scores = util.cos_sim(query_embedding, abstract_embeddings)[0].cpu().numpy()
+            filtered_abstracts = []
+            for abstract, score in zip(abstracts, cosine_scores):
+                logger.debug(f"Abstract score: {score:.3f} (threshold: {self.similarity_threshold})")
+                if score >= self.similarity_threshold:
+                    filtered_abstracts.append(abstract)
+            logger.info(f"Filtered {len(filtered_abstracts)} abstracts out of {len(abstracts)} based on similarity.")
+            return filtered_abstracts
+        except Exception as e:
+            logger.error(f"Error during abstract filtering: {e}")
+            return abstracts  # Fallback: return all if error occurs
+
+    def extract_entities(self, texts: List[str]) -> Dict[str, List[str]]:
+        """
+        Process a list of texts (abstracts) and extract biomedical entities using the NER pipeline.
+        Returns a dictionary with lists of proteins and pathways.
+        """
+        proteins = []
+        pathways = []
+        logger.debug("Extracting entities from abstracts using NER.")
+        for text in texts:
+            try:
+                ner_results = self.ner_pipeline(text)
+                # Iterate over the detected entities and select those of interest.
+                for entity in ner_results:
+                    entity_text = entity.get("word", "")
+                    # Here, we assume that entity labels include "PROTEIN" or "PATHWAY".
+                    # In practice, adjust these conditions based on your NER model's labels.
+                    if "protein" in entity_text.lower():
+                        proteins.append(entity_text)
+                    if "pathway" in entity_text.lower():
+                        pathways.append(entity_text)
+                logger.debug(f"Extracted {len(ner_results)} entities from one abstract.")
+            except Exception as e:
+                logger.error(f"Error processing text for NER: {e}")
+        # Deduplicate the lists
+        proteins = list(set(proteins))
+        pathways = list(set(pathways))
+        logger.info(f"Extracted {len(proteins)} unique proteins and {len(pathways)} unique pathways.")
+        return {"proteins": proteins, "pathways": pathways}
+
+    def rl_refine_entities(self, extracted: Dict[str, List[str]], query: str) -> Dict[str, List[str]]:
+        """
+        Placeholder for an RL-based module that refines and ranks the extracted entities.
+        In a production system, this method would use reinforcement learning to assign a reward
+        (e.g., based on relevance to the query) and adjust which entities to keep.
+        
+        For demonstration, we simulate this by filtering out entities with a dummy heuristic:
+        keep entities whose length is above a threshold (as a proxy for complexity).
+        """
+        def dummy_reward(entity: str) -> float:
+            # A dummy reward function that gives higher reward to longer entity names.
+            return len(entity) / 10.0
+
+        proteins = extracted.get("proteins", [])
+        pathways = extracted.get("pathways", [])
+        # Simulate RL selection: retain entities with a reward above a fixed threshold.
+        protein_threshold = self.config.get("RL_PROTEIN_THRESHOLD", 1.0)
+        pathway_threshold = self.config.get("RL_PATHWAY_THRESHOLD", 1.0)
+        refined_proteins = [p for p in proteins if dummy_reward(p) >= protein_threshold]
+        refined_pathways = [p for p in pathways if dummy_reward(p) >= pathway_threshold]
+        logger.info(f"RL refinement reduced proteins from {len(proteins)} to {len(refined_proteins)}; "
+                    f"pathways from {len(pathways)} to {len(refined_pathways)}.")
+        return {"proteins": refined_proteins, "pathways": refined_pathways}
+
+    def store_data(self, key: str, data: Dict[str, Any]) -> None:
+        """
+        Placeholder for storing data in persistent storage.
+        In a production system, implement actual storage (e.g., database, cache).
+        """
+        logger.debug(f"Storing data with key '{key}': {data}")
+        # e.g., self.storage.save(key, data)
+
+    def run(self, topic: str) -> Dict[str, Any]:
+        """
+        Execute the full knowledge extraction pipeline for the given topic.
+        1. Fetch literature from the external API.
+        2. Filter abstracts by semantic similarity to the query.
+        3. Extract entities (e.g., proteins, pathways) using an NER pipeline.
+        4. Refine the entity list using an RL-inspired selection.
+        5. Store and return the structured research data.
+        """
+        logger.info(f"Starting Knowledge Extraction for topic: '{topic}'")
+        # Step 1: Fetch literature data.
+        literature_data = self.fetch_literature(topic)
+        if literature_data.get("error"):
+            logger.error("Literature fetch failed; aborting knowledge extraction.")
+            return {"error": literature_data.get("error")}
+
+        # Assume literature_data contains an "abstracts" key.
+        abstracts = literature_data.get("abstracts", [])
+        if not abstracts:
+            logger.warning("No abstracts received from literature API.")
+        
+        # Step 2: Filter abstracts by relevance using text embeddings.
+        filtered_abstracts = self.filter_abstracts(abstracts, topic)
+        
+        # Step 3: Extract entities (proteins, pathways) from the filtered abstracts.
+        extracted_entities = self.extract_entities(filtered_abstracts)
+        
+        # Step 4: Optionally refine the extracted entities using an RL-based method.
+        refined_entities = self.rl_refine_entities(extracted_entities, topic)
+        
+        # Step 5: Assemble the research data.
+        research_data = {
+            "raw_literature": literature_data,
+            "filtered_abstracts": filtered_abstracts,
+            "extracted_entities": extracted_entities,
+            "refined_entities": refined_entities,
+            "proteins": refined_entities.get("proteins", []),
+            "pathways": refined_entities.get("pathways", [])
+        }
+        
+        # Store the research data for downstream modules.
+        self.store_data("knowledge_extraction", research_data)
+        logger.info("Knowledge extraction completed successfully.")
+        return research_data
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    config = {
+        "LITERATURE_API_KEY": "your_api_key_here",
+        "LITERATURE_API_ENDPOINT": "https://api.example.com/search",
+        "SIMILARITY_THRESHOLD": 0.6,
+        "RETRY_COUNT": 3,
+        "RETRY_DELAY": 2,
+        "RL_PROTEIN_THRESHOLD": 1.0,
+        "RL_PATHWAY_THRESHOLD": 1.0
+    }
+    agent = KnowledgeExtractionAgent(config)
+    topic = "Brain growth and neurogenesis"
+    research_output = agent.run(topic)
+    print("Final Research Data:")
+    print(research_output)
