@@ -1,0 +1,245 @@
+# expert_collaboration_module.py
+
+import os
+import json
+import logging
+import time
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+
+import numpy as np
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+
+import openai  # For ChatGPT integration
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "ExpertCollaborationModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("ExpertCollaborationModule")
+
+# SQLAlchemy base model.
+Base = declarative_base()
+
+# Define the ExpertFeedback table.
+class ExpertFeedback(Base):
+    __tablename__ = "expert_feedback"
+    id = Column(Integer, primary_key=True)
+    expert_id = Column(String(64), nullable=False)
+    candidate_id = Column(String(64), nullable=False)
+    feedback_text = Column(Text, nullable=False)
+    rating = Column(Float, nullable=False)  # e.g., 1.0 to 5.0
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+# Define the ExpertCollaborationModule.
+class ExpertCollaborationModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Expert Collaboration & Communication Module.
+        
+        config: Dictionary containing configuration parameters:
+          - DB_URL: Database URL for SQLAlchemy (default: SQLite local file).
+          - OPENAI_API_KEY: API key for ChatGPT integration.
+          - ALLOWED_EXPERT_ROLES: List of roles allowed to submit feedback.
+          - SENTIMENT_THRESHOLD: (Optional) Threshold for sentiment analysis.
+        """
+        self.config = config
+        self.db_url = config.get("DB_URL", "sqlite:///expert_feedback.db")
+        self.allowed_expert_roles = config.get("ALLOWED_EXPERT_ROLES", ["expert", "admin"])
+        self.sentiment_threshold = config.get("SENTIMENT_THRESHOLD", 0.0)  # Placeholder
+        # Set up SQLAlchemy engine and session.
+        self.engine = create_engine(self.db_url, echo=False, future=True)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        
+        # Set up ChatGPT integration.
+        self.openai_api_key = config.get("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            logger.error("Missing OPENAI_API_KEY in config.")
+            raise ValueError("OPENAI_API_KEY must be provided.")
+        openai.api_key = self.openai_api_key
+        
+        logger.info("Expert Collaboration Module initialized.")
+
+    def submit_feedback(self, expert_id: str, expert_role: str, candidate_id: str, feedback_text: str, rating: float) -> None:
+        """
+        Submit new expert feedback. Checks that the expert role is allowed.
+        
+        expert_id: Identifier for the expert.
+        expert_role: Role of the expert (e.g., "expert", "admin").
+        candidate_id: Identifier for the candidate (or pipeline run) being commented on.
+        feedback_text: Free-text expert comments.
+        rating: Numeric rating (e.g., 1.0 to 5.0).
+        """
+        if expert_role not in self.allowed_expert_roles:
+            logger.warning(f"Expert role '{expert_role}' not authorized to submit feedback.")
+            raise PermissionError("Access denied: unauthorized expert role.")
+        
+        session = self.Session()
+        try:
+            feedback = ExpertFeedback(
+                expert_id=expert_id,
+                candidate_id=candidate_id,
+                feedback_text=feedback_text,
+                rating=rating
+            )
+            session.add(feedback)
+            session.commit()
+            logger.info(json.dumps({
+                "event": "FeedbackSubmitted",
+                "expert_id": expert_id,
+                "candidate_id": candidate_id,
+                "rating": rating
+            }))
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error submitting feedback: {e}")
+            raise e
+        finally:
+            session.close()
+
+    def get_feedback(self, candidate_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Retrieve feedback entries. If candidate_id is provided, filter by candidate.
+        
+        Returns a list of feedback records as dictionaries.
+        """
+        session = self.Session()
+        try:
+            query = session.query(ExpertFeedback)
+            if candidate_id:
+                query = query.filter(ExpertFeedback.candidate_id == candidate_id)
+            records = query.all()
+            feedback_list = []
+            for record in records:
+                feedback_list.append({
+                    "id": record.id,
+                    "expert_id": record.expert_id,
+                    "candidate_id": record.candidate_id,
+                    "feedback_text": record.feedback_text,
+                    "rating": record.rating,
+                    "timestamp": record.timestamp.isoformat()
+                })
+            logger.info(f"Retrieved {len(feedback_list)} feedback records.")
+            return feedback_list
+        except Exception as e:
+            logger.error(f"Error retrieving feedback: {e}")
+            raise e
+        finally:
+            session.close()
+
+    def aggregate_feedback(self) -> Dict[str, Any]:
+        """
+        Aggregate expert feedback across all candidates.
+        
+        Returns a dictionary with:
+          - Average rating per candidate.
+          - A textual summary of feedback per candidate generated via ChatGPT.
+        """
+        session = self.Session()
+        try:
+            # Retrieve all feedback.
+            records = session.query(ExpertFeedback).all()
+            if not records:
+                logger.info("No feedback records to aggregate.")
+                return {}
+            # Group feedback by candidate_id.
+            feedback_by_candidate = {}
+            for record in records:
+                cid = record.candidate_id
+                if cid not in feedback_by_candidate:
+                    feedback_by_candidate[cid] = {"ratings": [], "comments": []}
+                feedback_by_candidate[cid]["ratings"].append(record.rating)
+                feedback_by_candidate[cid]["comments"].append(record.feedback_text)
+            
+            aggregated = {}
+            for cid, data in feedback_by_candidate.items():
+                avg_rating = np.mean(data["ratings"])
+                # Generate a consensus summary using ChatGPT.
+                summary = self._summarize_feedback(" ".join(data["comments"]))
+                aggregated[cid] = {
+                    "average_rating": float(avg_rating),
+                    "consensus_summary": summary,
+                    "num_feedback": len(data["ratings"])
+                }
+            logger.info("Aggregated expert feedback successfully.")
+            return aggregated
+        except Exception as e:
+            logger.error(f"Error aggregating feedback: {e}")
+            raise e
+        finally:
+            session.close()
+
+    def _summarize_feedback(self, feedback_text: str) -> str:
+        """
+        Use ChatGPT to generate a consensus summary of the provided feedback text.
+        
+        feedback_text: A string containing concatenated expert comments.
+        Returns a summary string.
+        """
+        try:
+            prompt = (
+                "You are an expert in drug discovery and clinical evaluation. "
+                "Please provide a concise consensus summary of the following expert feedback, "
+                "highlighting key insights, areas of agreement, and any critical concerns:\n\n" +
+                feedback_text + "\n\nSummary:"
+            )
+            response = openai.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are a highly experienced expert in drug discovery."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=150,
+            )
+            summary = response.choices[0].message["content"].strip()
+            logger.info("Feedback summary generated via ChatGPT.")
+            return summary
+        except Exception as e:
+            logger.error(f"Error generating feedback summary: {e}")
+            return "Summary unavailable due to an error."
+
+    def get_consensus(self) -> Dict[str, Any]:
+        """
+        Retrieve the aggregated consensus feedback for all candidates.
+        This function can be used to provide a dashboard view of expert opinions.
+        
+        Returns a dictionary mapping candidate IDs to aggregated feedback summaries.
+        """
+        aggregated = self.aggregate_feedback()
+        logger.info("Consensus feedback retrieved.")
+        return aggregated
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Example configuration for the Expert Collaboration Module.
+    config = {
+        "DB_URL": "sqlite:///expert_feedback.db",
+        "OPENAI_API_KEY": "your_openai_api_key_here",  # Replace with your actual API key.
+        "ALLOWED_EXPERT_ROLES": ["expert", "admin"],
+        "SENTIMENT_THRESHOLD": 0.0  # Placeholder value.
+    }
+    
+    expert_module = ExpertCollaborationModule(config)
+    
+    # Simulate submitting expert feedback.
+    try:
+        expert_module.submit_feedback("Expert_1", "expert", "Candidate_1", "This candidate shows promising binding affinity and a robust ADMET profile.", 4.5)
+        expert_module.submit_feedback("Expert_2", "expert", "Candidate_1", "The results are consistent; however, further validation is needed.", 4.0)
+        expert_module.submit_feedback("Expert_3", "admin", "Candidate_2", "Candidate 2 appears suboptimal in terms of toxicity and efficacy.", 2.5)
+    except Exception as e:
+        print(f"Error during feedback submission: {e}")
+    
+    # Retrieve feedback for Candidate_1.
+    feedback_candidate_1 = expert_module.get_feedback("Candidate_1")
+    print("Feedback for Candidate_1:")
+    print(json.dumps(feedback_candidate_1, indent=2))
+    
+    # Aggregate all feedback and generate consensus summaries.
+    consensus = expert_module.get_consensus()
+    print("Aggregated Consensus Feedback:")
+    print(json.dumps(consensus, indent=2))
