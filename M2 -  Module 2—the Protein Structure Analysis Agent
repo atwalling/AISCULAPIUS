@@ -1,0 +1,234 @@
+# protein_structure_analysis_agent.py
+
+import logging
+import requests
+import time
+from typing import Dict, Any, List
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Setup logging for this module
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("ProteinStructureAnalysisAgent")
+
+# -------------------------------
+# Dummy Graph Neural Network Model (Advanced Version)
+# -------------------------------
+class DummyGNN(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super(DummyGNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+# -------------------------------
+# Protein Structure Analysis Agent
+# -------------------------------
+class ProteinStructureAnalysisAgent:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Protein Structure Analysis Agent.
+        
+        config: Contains API endpoints, retry settings, GNN model parameters,
+                and optional parameters for RL-based refinement.
+        """
+        self.config = config
+        self.alphafold_api_endpoint = config.get("ALPHAFOLD_API_ENDPOINT", "https://api.alphafold.org/get_structure")
+        self.retry_count = config.get("RETRY_COUNT", 3)
+        self.retry_delay = config.get("RETRY_DELAY", 2)  # seconds
+        
+        # In-memory cache to store fetched structure data (avoid redundant API calls)
+        self.structure_cache: Dict[str, Dict[str, Any]] = {}
+        
+        # Setup device (GPU if available)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {self.device}")
+
+        # Initialize a dummy GNN model to process protein structure data.
+        input_dim = config.get("GNN_INPUT_DIM", 128)
+        hidden_dim = config.get("GNN_HIDDEN_DIM", 64)
+        output_dim = config.get("GNN_OUTPUT_DIM", 32)
+        self.gnn_model = DummyGNN(input_dim, hidden_dim, output_dim).to(self.device)
+        self.gnn_model.eval()  # Set model to evaluation mode.
+        logger.info("Initialized Dummy GNN model for protein structure processing.")
+
+        # Placeholder for persistent storage (if needed)
+        self.storage = None
+
+        # Parameters for RL-based refinement simulation
+        self.rl_refinement_factor = config.get("RL_REFINEMENT_FACTOR", 1.05)
+        # Multiple reference embeddings to simulate advanced similarity matching.
+        self.reference_embeddings = self._initialize_reference_embeddings(num_refs=3, dim=output_dim)
+
+    def _initialize_reference_embeddings(self, num_refs: int, dim: int) -> List[np.ndarray]:
+        """
+        Simulate initializing multiple reference embeddings.
+        In a real system, these could be learned prototypes representing key protein classes.
+        """
+        references = []
+        for i in range(num_refs):
+            # For reproducibility, use a fixed seed based on index.
+            np.random.seed(42 + i)
+            ref = np.random.rand(dim).astype(np.float32)
+            references.append(ref)
+        logger.debug(f"Initialized {num_refs} reference embeddings for similarity comparison.")
+        return references
+
+    def fetch_structure(self, protein: str) -> Dict[str, Any]:
+        """
+        Synchronously fetch protein structure data for the given protein.
+        Implements caching, retry logic, and error handling.
+        """
+        if protein in self.structure_cache:
+            logger.debug(f"Fetching '{protein}' from cache.")
+            return self.structure_cache[protein]
+
+        params = {"protein": protein}
+        for attempt in range(self.retry_count):
+            try:
+                logger.debug(f"Fetching structure (attempt {attempt+1}) for protein: '{protein}'")
+                response = requests.get(self.alphafold_api_endpoint, params=params, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+                logger.debug(f"Protein structure data retrieved successfully for {protein}.")
+                self.structure_cache[protein] = data  # Cache the result.
+                return data
+            except Exception as e:
+                logger.error(f"Attempt {attempt+1} failed for {protein}: {e}")
+                time.sleep(self.retry_delay)
+        error_msg = f"Failed to fetch structure data for {protein} after {self.retry_count} attempts."
+        logger.error(error_msg)
+        return {"error": error_msg}
+
+    def _simulate_structure_embedding(self, structure_data: Dict[str, Any]) -> np.ndarray:
+        """
+        Simulate converting raw structure data into an embedding vector.
+        In a real system, this might involve parsing PDB files and using advanced GNNs.
+        Uses the hash of the structure string to seed a random generator for reproducibility.
+        """
+        raw_structure = structure_data.get("structure", "")
+        if not raw_structure:
+            logger.warning("No raw structure data found; using zero vector.")
+            return np.zeros(self.config.get("GNN_INPUT_DIM", 128), dtype=np.float32)
+        seed = hash(raw_structure) % (2**32)
+        np.random.seed(seed)
+        embedding_dim = self.config.get("GNN_INPUT_DIM", 128)
+        embedding = np.random.rand(embedding_dim).astype(np.float32)
+        logger.debug(f"Simulated raw embedding for protein '{raw_structure[:10]}...': shape {embedding.shape}")
+        return embedding
+
+    def _process_structure(self, structure_data: Dict[str, Any]) -> np.ndarray:
+        """
+        Process the raw structure embedding using the GNN model.
+        Returns a processed embedding vector.
+        """
+        raw_embedding = self._simulate_structure_embedding(structure_data)
+        # Convert to torch tensor and move to device.
+        x = torch.from_numpy(raw_embedding).to(self.device)
+        with torch.no_grad():
+            processed_embedding = self.gnn_model(x)
+        processed_embedding_np = processed_embedding.cpu().numpy()
+        logger.debug(f"Processed embedding obtained: shape {processed_embedding_np.shape}")
+        return processed_embedding_np
+
+    def _refine_embedding(self, processed_embedding: np.ndarray, protein: str) -> np.ndarray:
+        """
+        Simulate an RL-based refinement step that adjusts the processed embedding.
+        For demonstration, if the norm of the embedding is below a threshold, the RL agent 'boosts' it.
+        """
+        norm = np.linalg.norm(processed_embedding)
+        logger.debug(f"Initial embedding norm for {protein}: {norm:.3f}")
+        threshold = self.config.get("EMBEDDING_NORM_THRESHOLD", 5.0)
+        if norm < threshold:
+            logger.debug(f"Embedding norm below threshold ({threshold}); applying RL refinement factor.")
+            refined_embedding = processed_embedding * self.rl_refinement_factor
+        else:
+            refined_embedding = processed_embedding
+        refined_norm = np.linalg.norm(refined_embedding)
+        logger.debug(f"Refined embedding norm for {protein}: {refined_norm:.3f}")
+        return refined_embedding
+
+    def _compute_similarity(self, processed_embedding: np.ndarray) -> float:
+        """
+        Compute the maximum cosine similarity between the processed embedding and a set of reference embeddings.
+        """
+        processed_norm = processed_embedding / np.linalg.norm(processed_embedding)
+        similarities = []
+        for ref in self.reference_embeddings:
+            ref_norm = ref / np.linalg.norm(ref)
+            similarity = float(np.dot(processed_norm, ref_norm))
+            similarities.append(similarity)
+            logger.debug(f"Similarity with one reference: {similarity:.3f}")
+        max_similarity = max(similarities) if similarities else 0.0
+        logger.debug(f"Maximum similarity selected: {max_similarity:.3f}")
+        return max_similarity
+
+    def reason(self, protein: str, structure_data: Dict[str, Any], processed_embedding: np.ndarray) -> None:
+        """
+        Agentic reasoning about the protein structure.
+        Here we log key metrics and simulate a decision based on the embedding's norm.
+        This is a placeholder where an RL agent could update internal parameters based on rewards.
+        """
+        norm = np.linalg.norm(processed_embedding)
+        logger.debug(f"Agentic reasoning for {protein}: Processed embedding norm = {norm:.3f}")
+        # In a full implementation, the RL agent would adjust thresholds or parameters here.
+        return
+
+    def run(self, research_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        For each protein in the research data, fetch its structure, process it with a GNN,
+        apply an RL-inspired refinement step, and compute similarity scores against multiple references.
+        Returns a dictionary containing detailed structure analysis per protein.
+        """
+        proteins = research_data.get("proteins", [])
+        protein_analysis = {}
+        logger.info("Starting protein structure analysis for proteins: " + ", ".join(proteins))
+        for protein in proteins:
+            structure_data = self.fetch_structure(protein)
+            if "error" in structure_data:
+                protein_analysis[protein] = {"error": structure_data.get("error")}
+                continue
+            # Process structure to obtain an embedding.
+            processed_embedding = self._process_structure(structure_data)
+            # Apply an RL-based refinement (simulated).
+            refined_embedding = self._refine_embedding(processed_embedding, protein)
+            # Agentic reasoning (log details, placeholder for further RL-based decisions).
+            self.reason(protein, structure_data, refined_embedding)
+            # Compute similarity using multiple reference embeddings.
+            similarity_score = self._compute_similarity(refined_embedding)
+            protein_analysis[protein] = {
+                "raw_structure": structure_data,
+                "processed_embedding": refined_embedding.tolist(),  # Convert for JSON serialization.
+                "similarity_score": similarity_score
+            }
+        logger.info("Protein structure analysis completed.")
+        return protein_analysis
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    config = {
+        "ALPHAFOLD_API_ENDPOINT": "https://api.alphafold.org/get_structure",
+        "RETRY_COUNT": 3,
+        "RETRY_DELAY": 2,
+        "GNN_INPUT_DIM": 128,
+        "GNN_HIDDEN_DIM": 64,
+        "GNN_OUTPUT_DIM": 32,
+        "EMBEDDING_NORM_THRESHOLD": 5.0,
+        "RL_REFINEMENT_FACTOR": 1.05
+    }
+    agent = ProteinStructureAnalysisAgent(config)
+    # Dummy research_data from Module 1; in practice, this data includes proteins identified during knowledge extraction.
+    dummy_research_data = {"proteins": ["ProteinX", "ProteinY", "ProteinZ"]}
+    analysis_output = agent.run(dummy_research_data)
+    print("Protein Structure Analysis Output:")
+    print(analysis_output)
