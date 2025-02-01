@@ -1,0 +1,276 @@
+# candidate_diversification_module.py
+
+import os
+import json
+import logging
+from typing import Dict, Any, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+# Attempt to import RDKit for molecular fingerprinting and similarity.
+try:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem, DataStructs
+except ImportError:
+    Chem = None
+    AllChem = None
+    DataStructs = None
+
+import openai  # For ChatGPT integration (optional)
+
+# Setup structured JSON logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "CandidateDiversificationModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("CandidateDiversificationModule")
+
+
+class CandidateDiversificationModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Candidate Diversification & Exploration Module.
+        
+        Config parameters:
+          - NUM_GENERATED_VARIANTS: Number of variants to generate per input candidate.
+          - DIVERSITY_THRESHOLD: Minimum average dissimilarity required to consider a candidate diverse.
+          - HISTORICAL_MEMORY_FILE: Path to a JSON file storing previously explored candidate SMILES (optional).
+          - CHATGPT_MODEL: Model to use for expert summarization (e.g., "gpt-4").
+          - OPENAI_API_KEY: API key for ChatGPT integration.
+          - EXPLORATION_WEIGHT: Weight factor to balance exploration (diversity) vs exploitation (predicted quality).
+        """
+        self.config = config
+        self.num_variants = config.get("NUM_GENERATED_VARIANTS", 5)
+        self.diversity_threshold = config.get("DIVERSITY_THRESHOLD", 0.3)
+        self.historical_memory_file = config.get("HISTORICAL_MEMORY_FILE", "historical_candidates.json")
+        self.exploration_weight = config.get("EXPLORATION_WEIGHT", 1.0)
+        self.chatgpt_model = config.get("CHATGPT_MODEL", "gpt-4")
+        self.openai_api_key = config.get("OPENAI_API_KEY", None)
+        if self.openai_api_key:
+            openai.api_key = self.openai_api_key
+        else:
+            logger.warning("No OpenAI API key provided; expert summarization will be skipped.")
+        
+        # Load historical candidate memory.
+        self.historical_candidates = self._load_historical_memory()
+        logger.info("Candidate Diversification Module initialized.")
+
+    def _load_historical_memory(self) -> List[str]:
+        """
+        Load historical candidate SMILES from a JSON file.
+        Returns a list of SMILES strings. If the file doesn't exist, returns an empty list.
+        """
+        if os.path.exists(self.historical_memory_file):
+            try:
+                with open(self.historical_memory_file, "r") as f:
+                    data = json.load(f)
+                logger.info(f"Loaded {len(data)} historical candidates.")
+                return data
+            except Exception as e:
+                logger.error(f"Error loading historical memory: {e}")
+                return []
+        else:
+            logger.info("No historical memory file found; starting with an empty history.")
+            return []
+
+    def _save_historical_memory(self) -> None:
+        """
+        Save the current historical candidate memory to file.
+        """
+        try:
+            with open(self.historical_memory_file, "w") as f:
+                json.dump(self.historical_candidates, f, indent=2)
+            logger.info("Historical memory updated.")
+        except Exception as e:
+            logger.error(f"Error saving historical memory: {e}")
+
+    def _compute_fingerprint(self, smiles: str):
+        """
+        Compute the Morgan fingerprint for a given SMILES string using RDKit.
+        Returns an RDKit ExplicitBitVect.
+        """
+        if Chem is None or AllChem is None:
+            logger.warning("RDKit not available; returning None for fingerprint.")
+            return None
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            logger.error(f"Invalid SMILES '{smiles}' for fingerprint computation.")
+            return None
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+        return fp
+
+    def _tanimoto_similarity(self, fp1, fp2) -> float:
+        """
+        Compute the Tanimoto similarity between two RDKit fingerprints.
+        """
+        if fp1 is None or fp2 is None:
+            return 0.0
+        return DataStructs.TanimotoSimilarity(fp1, fp2)
+
+    def _generate_variant(self, smiles: str) -> str:
+        """
+        Generate a variant of the input SMILES string.
+        This is a dummy generative model that applies random perturbations.
+        In a production system, this could be replaced with a VAE or diffusion model.
+        For demonstration, randomly replace a character in the SMILES with another valid character.
+        """
+        if not smiles:
+            return ""
+        valid_chars = list("BCNOFPSIclbr=#$()123456789")  # Simplified set of valid characters.
+        smiles_list = list(smiles)
+        pos = np.random.randint(0, len(smiles_list))
+        new_char = np.random.choice(valid_chars)
+        original_char = smiles_list[pos]
+        smiles_list[pos] = new_char
+        variant = "".join(smiles_list)
+        logger.debug(f"Generated variant for SMILES '{smiles}': replaced '{original_char}' at pos {pos} with '{new_char}' -> '{variant}'")
+        return variant
+
+    def generate_variants(self, candidate_smiles: str) -> List[str]:
+        """
+        Generate multiple variants for a given candidate SMILES string.
+        Returns a list of unique variant SMILES, including the original.
+        """
+        variants = {candidate_smiles}
+        attempts = 0
+        while len(variants) < self.num_variants + 1 and attempts < self.num_variants * 3:
+            variant = self._generate_variant(candidate_smiles)
+            variants.add(variant)
+            attempts += 1
+        logger.info(f"Generated {len(variants)-1} variants for candidate '{candidate_smiles}'.")
+        return list(variants)
+
+    def evaluate_diversity(self, candidate_smiles: str, candidate_set: List[str]) -> float:
+        """
+        Evaluate the novelty of a candidate SMILES string relative to a set of candidates.
+        Returns a novelty score between 0 and 1, where 1 indicates maximum novelty.
+        Computes the average Tanimoto dissimilarity between the candidate and each candidate in candidate_set.
+        """
+        fp_candidate = self._compute_fingerprint(candidate_smiles)
+        if fp_candidate is None or not candidate_set:
+            return 1.0  # If we cannot compute similarity, treat as novel.
+        dissimilarities = []
+        for other in candidate_set:
+            fp_other = self._compute_fingerprint(other)
+            sim = self._tanimoto_similarity(fp_candidate, fp_other)
+            dissimilarities.append(1 - sim)
+        avg_novelty = np.mean(dissimilarities)
+        return avg_novelty
+
+    def diversify_candidates(self, input_candidates: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Diversify a set of candidate molecules by generating variants and selecting a diverse subset.
+        
+        input_candidates: Dictionary mapping candidate IDs to their SMILES strings.
+        
+        Returns a dictionary mapping candidate IDs to a dictionary with:
+          - "diversified_candidates": A list of selected diverse candidate SMILES.
+          - "diversity_metrics": Dictionary of novelty scores for each selected candidate.
+        Updates historical candidate memory with newly accepted candidates.
+        """
+        diversified_results = {}
+        for cand_id, smiles in input_candidates.items():
+            # Generate variants.
+            variants = self.generate_variants(smiles)
+            # Evaluate diversity relative to historical memory and current input candidates.
+            combined_memory = list(input_candidates.values()) + self.historical_candidates
+            novelty_scores = {variant: self.evaluate_diversity(variant, combined_memory) for variant in variants}
+            # Select candidates that exceed the diversity threshold.
+            selected = [variant for variant, score in novelty_scores.items() if score >= self.diversity_threshold]
+            # If no variant meets the threshold, select the variant with the highest novelty score.
+            if not selected:
+                best_variant = max(novelty_scores, key=novelty_scores.get)
+                selected = [best_variant]
+            diversified_results[cand_id] = {
+                "diversified_candidates": selected,
+                "diversity_metrics": {variant: novelty_scores[variant] for variant in selected}
+            }
+            # Update historical memory.
+            self.historical_candidates.extend(selected)
+            # Deduplicate historical memory.
+            self.historical_candidates = list(set(self.historical_candidates))
+            logger.info(json.dumps({
+                "event": "CandidateDiversification",
+                "candidate_id": cand_id,
+                "selected_variants": selected,
+                "diversity_metrics": {variant: novelty_scores[variant] for variant in selected}
+            }))
+        # Save updated historical memory.
+        self._save_historical_memory()
+        return diversified_results
+
+    def generate_expert_summary(self, diversification_report: Dict[str, Any]) -> str:
+        """
+        Generate an expert-level summary of the candidate diversification results using ChatGPT.
+        Returns a summary string.
+        """
+        try:
+            prompt = (
+                "You are an expert in cheminformatics and drug design. Analyze the following candidate diversification report, "
+                "which includes the selected diverse candidate SMILES strings and their novelty scores. Provide a concise summary "
+                "of the diversity achieved, any potential redundancies, and recommendations for further exploration:\n\n"
+                + json.dumps(diversification_report, indent=2) +
+                "\n\nExpert Summary:"
+            )
+            response = openai.ChatCompletion.create(
+                model=self.chatgpt_model,
+                messages=[
+                    {"role": "system", "content": "You are a leading expert in drug discovery and molecular diversity."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=250,
+            )
+            summary = response.choices[0].message["content"].strip()
+            logger.info("Expert summary generated via ChatGPT for candidate diversification.")
+            return summary
+        except Exception as e:
+            logger.error(f"Error generating expert summary: {e}")
+            return "Expert summary unavailable due to an error."
+
+    def run(self, input_candidates: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute the candidate diversification and exploration process.
+        
+        input_candidates: Dictionary mapping candidate IDs to candidate details (at minimum, SMILES strings).
+        Returns a dictionary with:
+          - "diversification_report": Detailed diversification and novelty metrics for each candidate.
+          - "expert_summary": (Optional) Expert interpretation generated via ChatGPT.
+        """
+        diversification_report = self.diversify_candidates(input_candidates)
+        expert_summary = self.generate_expert_summary(diversification_report)
+        output = {
+            "diversification_report": diversification_report,
+            "expert_summary": expert_summary
+        }
+        logger.info("Candidate diversification and exploration completed.")
+        return output
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the Candidate Diversification Module.
+    config = {
+        "NUM_GENERATED_VARIANTS": 5,
+        "DIVERSITY_THRESHOLD": 0.3,
+        "HISTORICAL_MEMORY_FILE": "historical_candidates.json",
+        "CHATGPT_MODEL": "gpt-4",
+        "OPENAI_API_KEY": "your_openai_api_key_here",  # Replace with your actual API key.
+        "EXPLORATION_WEIGHT": 1.0
+    }
+    
+    cd_module = CandidateDiversificationModule(config)
+    
+    # Simulate input candidates (SMILES strings) from a previous module.
+    input_candidates = {
+        "Candidate_1": "CCO",         # Ethanol
+        "Candidate_2": "CCCC",        # Butane
+        "Candidate_3": "CCN",         # Ethylamine
+        "Candidate_4": "CCOC",        # Ethoxyethane
+        "Candidate_5": "CCCCO"        # Pentanol
+    }
+    
+    diversification_output = cd_module.run(input_candidates)
+    print("Candidate Diversification & Exploration Output:")
+    print(json.dumps(diversification_output, indent=2))
