@@ -1,0 +1,256 @@
+# advanced_pipeline_orchestrator.py
+
+import asyncio
+import concurrent.futures
+import json
+import logging
+import time
+from typing import Dict, Any
+
+import numpy as np
+import openai
+from fastapi import FastAPI, HTTPException
+import uvicorn
+
+# Import our module classes (assumed implemented as per previous modules)
+from knowledge_extraction_agent import KnowledgeExtractionAgent
+from protein_structure_analysis_agent import ProteinStructureAnalysisAgent
+from docking_simulation_agent import DockingSimulationAgent
+from generative_optimization_agent import GenerativeOptimizationAgent
+from genome_editing_agent import GenomeEditingAgent
+from advanced_feedback_continual_learning_agent_v2 import AdvancedFeedbackContinualLearningAgent
+
+# Setup structured logging (JSON formatted)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "PipelineOrchestrator", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("PipelineOrchestrator")
+
+# Global configuration – replace placeholder API keys with real ones.
+GLOBAL_CONFIG = {
+    "LITERATURE_API_KEY": "your_literature_api_key_here",
+    "LITERATURE_API_ENDPOINT": "https://api.example.com/search",
+    "ALPHAFOLD_API_ENDPOINT": "https://api.alphafold.org/get_structure",
+    "DOCKING_API_ENDPOINT": "https://api.dockingsim.com/simulate",
+    "MODEL_INPUT_DIM": 128,
+    "LATENT_DIM": 32,
+    "MAX_OPT_ITERATIONS": 20,
+    "LEARNING_RATE": 0.01,
+    "GUIDE_SEQ_LENGTH": 20,
+    "BATCH_SIZE": 16,
+    "FEEDBACK_LEARNING_RATE": 0.001,
+    "META_UPDATE_STRATEGY": "cosine_warm_restarts",
+    "UNCERTAINTY_WEIGHT": 1.0,
+    "CHATGPT_MODEL": "gpt-4",
+    "OPENAI_API_KEY": "your_openai_api_key_here",  # Replace with your actual API key.
+    "HISTORY_LOG": True,
+    "USE_LOOKAHEAD": True,
+    "GRAD_CLIP": 5.0,
+    "RL_MAX_ITERATIONS": 3,
+    "AFFINITY_THRESHOLD": -7.0,
+    "RL_IMPROVEMENT_FACTOR": 0.95,
+    "GC_WEIGHT": 1.0,
+    "PROPERTY_WEIGHTS": {"on_target": -1.0, "off_target": 1.0, "expression_boost": -1.0},
+    "DEVICE": "cuda"  # or "cpu"
+}
+
+# Set OpenAI API key globally
+openai.api_key = GLOBAL_CONFIG["OPENAI_API_KEY"]
+
+class PipelineOrchestrator:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        logger.info(json.dumps({
+            "event": "OrchestratorInitialization",
+            "timestamp": time.ctime(),
+            "config": config
+        }))
+        # Instantiate modules
+        self.knowledge_agent = KnowledgeExtractionAgent(config)
+        self.protein_agent = ProteinStructureAnalysisAgent(config)
+        self.docking_agent = DockingSimulationAgent(config)
+        self.generative_agent = GenerativeOptimizationAgent(config)
+        self.genome_agent = GenomeEditingAgent(config)
+        self.feedback_agent = AdvancedFeedbackContinualLearningAgent(config)
+        # ThreadPoolExecutor for blocking I/O tasks (if needed)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+    async def run_pipeline(self, topic: str) -> Dict[str, Any]:
+        overall_report = {"topic": topic, "timestamp": time.ctime()}
+        
+        # Step 1: Knowledge Extraction
+        try:
+            logger.info(f"Starting Knowledge Extraction for topic '{topic}'")
+            research_data = await asyncio.get_event_loop().run_in_executor(
+                self.executor, self.knowledge_agent.run, topic
+            )
+            overall_report["research_data"] = research_data
+        except Exception as e:
+            logger.error(json.dumps({"event": "KnowledgeExtractionError", "error": str(e)}))
+            overall_report["research_data_error"] = str(e)
+            research_data = {}
+        
+        # Step 2: Protein Structure Analysis
+        try:
+            logger.info("Starting Protein Structure Analysis")
+            protein_data = await asyncio.get_event_loop().run_in_executor(
+                self.executor, self.protein_agent.run, research_data
+            )
+            overall_report["protein_data"] = protein_data
+        except Exception as e:
+            logger.error(json.dumps({"event": "ProteinAnalysisError", "error": str(e)}))
+            overall_report["protein_data_error"] = str(e)
+            protein_data = {}
+        
+        # Step 3: Docking Simulation (parallelize over proteins)
+        try:
+            logger.info("Starting Docking Simulation")
+            docking_results = await self._run_module_parallel(self.docking_agent.run, protein_data)
+            overall_report["docking_results"] = docking_results
+        except Exception as e:
+            logger.error(json.dumps({"event": "DockingSimulationError", "error": str(e)}))
+            overall_report["docking_results_error"] = str(e)
+            docking_results = {}
+        
+        # Step 4: Generative Optimization (parallelize over proteins)
+        try:
+            logger.info("Starting Generative Optimization")
+            optimized_candidates = await self._run_module_parallel(self.generative_agent.run, docking_results)
+            overall_report["optimized_candidates"] = optimized_candidates
+        except Exception as e:
+            logger.error(json.dumps({"event": "GenerativeOptimizationError", "error": str(e)}))
+            overall_report["optimized_candidates_error"] = str(e)
+            optimized_candidates = {}
+        
+        # Step 5: Genome Editing Design (parallelize over proteins)
+        try:
+            logger.info("Starting Genome Editing Design")
+            genome_editing_design = await self._run_module_parallel(self.genome_agent.run, optimized_candidates)
+            overall_report["genome_editing_design"] = genome_editing_design
+        except Exception as e:
+            logger.error(json.dumps({"event": "GenomeEditingError", "error": str(e)}))
+            overall_report["genome_editing_design_error"] = str(e)
+            genome_editing_design = {}
+        
+        # Step 6: Feedback & Continual Learning Integration
+        try:
+            logger.info("Starting Feedback Integration")
+            # In a real system, feedback_data would be sourced from experiments, expert reviews, etc.
+            dummy_ground_truth = np.random.rand(self.config.get("BATCH_SIZE", 16), 3).astype(np.float32)
+            dummy_predictions = {
+                "property_predictor": np.random.rand(self.config.get("BATCH_SIZE", 16), 3).astype(np.float32)
+            }
+            dummy_uncertainties = {
+                "property_predictor": np.random.uniform(0.8, 1.2, size=(self.config.get("BATCH_SIZE", 16),)).astype(np.float32)
+            }
+            feedback_data = {
+                "ground_truth": dummy_ground_truth,
+                "predictions": dummy_predictions,
+                "uncertainties": dummy_uncertainties
+            }
+            feedback_report = await asyncio.get_event_loop().run_in_executor(
+                self.executor, self.feedback_agent.run, feedback_data
+            )
+            overall_report["feedback_report"] = feedback_report
+        except Exception as e:
+            logger.error(json.dumps({"event": "FeedbackIntegrationError", "error": str(e)}))
+            overall_report["feedback_report_error"] = str(e)
+        
+        # Step 7: Final Summary and ChatGPT Analysis (asynchronously)
+        try:
+            final_summary = {
+                "research_data": overall_report.get("research_data", {}),
+                "protein_data": overall_report.get("protein_data", {}),
+                "docking_results": overall_report.get("docking_results", {}),
+                "optimized_candidates": overall_report.get("optimized_candidates", {}),
+                "genome_editing_design": overall_report.get("genome_editing_design", {}),
+                "feedback_report": overall_report.get("feedback_report", {})
+            }
+            summary_str = json.dumps(final_summary, indent=2)
+            prompt = (
+                "You are a world-class expert in AI-driven drug discovery. Review the following comprehensive pipeline "
+                "report and provide a strategic summary including key findings, potential improvements, and recommendations "
+                "for optimizing the pipeline further:\n\n" + summary_str + "\n\nYour analysis:"
+            )
+            chatgpt_analysis = await self._get_chatgpt_analysis(prompt)
+            overall_report["final_analysis"] = chatgpt_analysis
+        except Exception as e:
+            logger.error(json.dumps({"event": "FinalAnalysisError", "error": str(e)}))
+            overall_report["final_analysis_error"] = str(e)
+        
+        overall_report["pipeline_status"] = "Completed"
+        logger.info(json.dumps({"event": "PipelineCompleted", "timestamp": time.ctime()}))
+        return overall_report
+
+    async def _run_module_parallel(self, module_run_func, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Run a module's run() method in parallel over each key in the input_data dictionary.
+        Returns a dictionary mapping each key to its module output.
+        """
+        loop = asyncio.get_event_loop()
+        tasks = []
+        # Assume input_data is a dictionary where keys are protein names.
+        for key, value in input_data.items():
+            # Each task is run in the thread pool.
+            tasks.append(loop.run_in_executor(self.executor, module_run_func, {key: value}))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        combined_results = {}
+        for key, result in zip(input_data.keys(), results):
+            if isinstance(result, Exception):
+                logger.error(json.dumps({"event": "ModuleParallelError", "key": key, "error": str(result)}))
+                combined_results[key] = {"error": str(result)}
+            else:
+                # Each module_run_func returns a dict with one key.
+                combined_results.update(result)
+        return combined_results
+
+    async def _get_chatgpt_analysis(self, prompt: str) -> str:
+        """
+        Asynchronously send the prompt to ChatGPT and return its analysis.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            # Run synchronous ChatGPT API call in an executor.
+            response = await loop.run_in_executor(
+                self.executor,
+                lambda: openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "You are a knowledgeable and innovative expert in AI-driven drug discovery."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.2,
+                    max_tokens=300,
+                )
+            )
+            analysis = response.choices[0].message["content"].strip()
+            logger.info(json.dumps({"event": "ChatGPTAnalysisReceived", "analysis": analysis}))
+            return analysis
+        except Exception as e:
+            logger.error(json.dumps({"event": "ChatGPTAnalysisError", "error": str(e)}))
+            return "Error: Failed to obtain analysis from ChatGPT."
+
+# FastAPI app for external access.
+app = FastAPI(title="Revolutionary Drug Discovery Pipeline Orchestrator")
+
+# Instantiate the orchestrator.
+pipeline_orchestrator = PipelineOrchestrator(GLOBAL_CONFIG)
+
+@app.get("/run_pipeline")
+async def run_pipeline(topic: str):
+    try:
+        report = await pipeline_orchestrator.run_pipeline(topic)
+        return report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# For standalone running.
+if __name__ == "__main__":
+    # Run the pipeline orchestrator with a sample topic.
+    sample_topic = "Brain growth and neurogenesis"
+    final_report = asyncio.run(pipeline_orchestrator.run_pipeline(sample_topic))
+    print("Final Pipeline Report:")
+    print(json.dumps(final_report, indent=2))
+    # Uncomment to run FastAPI:
+    # uvicorn.run(app, host="0.0.0.0", port=8000)
