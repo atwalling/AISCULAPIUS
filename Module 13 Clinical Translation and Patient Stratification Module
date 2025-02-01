@@ -1,0 +1,211 @@
+# clinical_translation_module.py
+
+import logging
+import json
+import time
+from typing import Dict, Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.cluster import KMeans
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "ClinicalTranslationModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("ClinicalTranslationModule")
+
+
+class ClinicalPredictor(nn.Module):
+    """
+    A neural network that predicts clinical outcomes for a candidate molecule in a given patient context.
+    Input: A combined feature vector (candidate features concatenated with patient features).
+    Output: Two scores: [efficacy, risk], where higher efficacy and lower risk are desired.
+    Monte Carlo dropout is enabled for uncertainty estimation.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int = 64, output_dim: int = 2, dropout_rate: float = 0.3):
+        super(ClinicalPredictor, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc3 = nn.Linear(hidden_dim // 2, output_dim)
+    
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)  # Dropout active for MC sampling.
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+class ClinicalTranslationModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Clinical Translation and Patient Stratification Module.
+        
+        Config parameters include:
+          - NUM_PATIENT_CLUSTERS: Number of clusters for patient stratification.
+          - PATIENT_FEATURE_DIM: Dimensionality of patient multi-omics feature vector.
+          - CANDIDATE_FEATURE_DIM: Dimensionality of candidate feature vector.
+          - HIDDEN_DIM: Hidden layer size for the clinical predictor model.
+          - DROPOUT_RATE: Dropout rate for Monte Carlo dropout.
+          - NUM_MC_SAMPLES: Number of Monte Carlo samples for uncertainty estimation.
+          - DEVICE: "cuda" or "cpu".
+        """
+        self.config = config
+        self.num_clusters = config.get("NUM_PATIENT_CLUSTERS", 5)
+        self.patient_feature_dim = config.get("PATIENT_FEATURE_DIM", 50)
+        self.candidate_feature_dim = config.get("CANDIDATE_FEATURE_DIM", 20)
+        self.clinical_input_dim = self.patient_feature_dim + self.candidate_feature_dim
+        self.hidden_dim = config.get("HIDDEN_DIM", 64)
+        self.dropout_rate = config.get("DROPOUT_RATE", 0.3)
+        self.num_mc_samples = config.get("NUM_MC_SAMPLES", 20)
+        self.device = torch.device(config.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+        
+        # Initialize the clinical predictor model.
+        self.clinical_model = ClinicalPredictor(self.clinical_input_dim, self.hidden_dim, output_dim=2, dropout_rate=self.dropout_rate).to(self.device)
+        # In a production system, pre-trained weights could be loaded here.
+        self.clinical_model.eval()  # Set to evaluation mode (dropout still active when model.train() is set for MC dropout).
+        
+        logger.info("Clinical Translation Module initialized.")
+
+    def stratify_patients(self, patient_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Stratify patients into clusters based on their multi-omics feature vectors using KMeans clustering.
+        
+        patient_data: Dictionary mapping patient IDs to feature vectors (list or NumPy array).
+        
+        Returns a dictionary with:
+          - "patient_clusters": Mapping from patient ID to cluster label.
+          - "cluster_centers": Centroids of the clusters.
+        """
+        patient_ids = list(patient_data.keys())
+        features = []
+        for pid in patient_ids:
+            feat = np.array(patient_data[pid], dtype=np.float32)
+            features.append(feat)
+        features = np.vstack(features)  # Shape: [num_patients, feature_dim]
+        
+        # Perform KMeans clustering.
+        kmeans = KMeans(n_clusters=self.num_clusters, random_state=42)
+        cluster_labels = kmeans.fit_predict(features)
+        patient_clusters = {pid: int(label) for pid, label in zip(patient_ids, cluster_labels)}
+        cluster_centers = kmeans.cluster_centers_.tolist()
+        logger.info(json.dumps({
+            "event": "PatientStratification",
+            "patient_clusters": patient_clusters,
+            "cluster_centers": cluster_centers
+        }))
+        return {"patient_clusters": patient_clusters, "cluster_centers": cluster_centers}
+
+    def predict_candidate_efficacy(self, candidate_features: Dict[str, Any], patient_clusters: Dict[str, int], patient_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Predict clinical efficacy and risk for each candidate molecule across patient clusters.
+        
+        candidate_features: Dictionary mapping candidate IDs to candidate feature vectors (list or NumPy array).
+        patient_clusters: Mapping from patient IDs to cluster labels.
+        patient_data: Dictionary mapping patient IDs to multi-omics feature vectors.
+        
+        Returns a dictionary mapping candidate IDs to predictions per cluster.
+        For each candidate, for each cluster, the output includes:
+          - "efficacy_mean": Mean predicted efficacy.
+          - "efficacy_std": Standard deviation (uncertainty) of efficacy.
+          - "risk_mean": Mean predicted risk.
+          - "risk_std": Standard deviation (uncertainty) of risk.
+        """
+        results = {}
+        for cand_id, cand_feat in candidate_features.items():
+            cand_feat = np.array(cand_feat, dtype=np.float32)
+            cluster_predictions = {}
+            for cluster in range(self.num_clusters):
+                # Select patient features belonging to the current cluster.
+                cluster_patient_feats = [np.array(patient_data[pid], dtype=np.float32)
+                                         for pid, cl in patient_clusters.items() if cl == cluster]
+                if len(cluster_patient_feats) == 0:
+                    continue
+                # Use the average patient feature vector for the cluster.
+                avg_patient_feat = np.mean(cluster_patient_feats, axis=0)
+                # Concatenate candidate features and the average patient feature vector.
+                input_vector = np.concatenate([cand_feat, avg_patient_feat])  # Shape: [clinical_input_dim]
+                input_tensor = torch.tensor(input_vector, dtype=torch.float32, device=self.device)
+                
+                # Enable MC dropout: set model to training mode.
+                self.clinical_model.train()
+                predictions = []
+                with torch.no_grad():
+                    for _ in range(self.num_mc_samples):
+                        output = self.clinical_model(input_tensor)
+                        predictions.append(output.cpu().numpy())
+                predictions = np.array(predictions)  # Shape: [num_mc_samples, 2]
+                efficacy_vals = predictions[:, 0]
+                risk_vals = predictions[:, 1]
+                cluster_predictions[str(cluster)] = {
+                    "efficacy_mean": float(np.mean(efficacy_vals)),
+                    "efficacy_std": float(np.std(efficacy_vals)),
+                    "risk_mean": float(np.mean(risk_vals)),
+                    "risk_std": float(np.std(risk_vals))
+                }
+            results[cand_id] = cluster_predictions
+            logger.debug(json.dumps({
+                "event": "CandidatePrediction",
+                "candidate_id": cand_id,
+                "predictions": cluster_predictions
+            }))
+        logger.info("Candidate clinical outcome predictions completed.")
+        return results
+
+    def run(self, candidate_features: Dict[str, Any], patient_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Run the clinical translation module.
+        
+        candidate_features: Dictionary mapping candidate IDs to feature vectors.
+        patient_data: Dictionary mapping patient IDs to multi-omics feature vectors.
+        
+        Returns a dictionary with:
+          - "patient_stratification": Output of the stratify_patients() method.
+          - "candidate_predictions": Output of the predict_candidate_efficacy() method.
+        """
+        stratification = self.stratify_patients(patient_data)
+        predictions = self.predict_candidate_efficacy(candidate_features, stratification["patient_clusters"], patient_data)
+        overall_results = {
+            "patient_stratification": stratification,
+            "candidate_predictions": predictions
+        }
+        logger.info("Clinical translation and patient stratification completed.")
+        return overall_results
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the Clinical Translation Module.
+    config = {
+        "NUM_PATIENT_CLUSTERS": 3,
+        "PATIENT_FEATURE_DIM": 50,
+        "CANDIDATE_FEATURE_DIM": 20,
+        "HIDDEN_DIM": 64,
+        "DROPOUT_RATE": 0.3,
+        "NUM_MC_SAMPLES": 20,
+        "DEVICE": "cpu"
+    }
+    
+    clin_module = ClinicalTranslationModule(config)
+    
+    # Simulate candidate features: mapping candidate IDs to 20-dimensional feature vectors.
+    candidate_features = {
+        "Candidate_1": np.random.rand(20).tolist(),
+        "Candidate_2": np.random.rand(20).tolist(),
+        "Candidate_3": np.random.rand(20).tolist()
+    }
+    
+    # Simulate patient data: mapping patient IDs to 50-dimensional multi-omics feature vectors.
+    patient_data = {}
+    for i in range(30):
+        patient_id = f"Patient_{i+1}"
+        patient_data[patient_id] = np.random.rand(50).tolist()
+    
+    clinical_results = clin_module.run(candidate_features, patient_data)
+    print("Clinical Translation and Patient Stratification Results:")
+    print(json.dumps(clinical_results, indent=2))
