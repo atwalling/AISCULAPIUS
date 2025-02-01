@@ -1,0 +1,259 @@
+# regulatory_documentation_module.py
+
+import json
+import logging
+from datetime import datetime
+from typing import Dict, Any
+
+import numpy as np
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "RegulatoryDocModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("RegulatoryDocModule")
+
+
+class RegulatoryDocumentationModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Regulatory and Documentation Generation Module.
+        
+        config: Dictionary containing configuration parameters:
+          - DOCUMENT_TEMPLATE: (Optional) A string template for the regulatory document.
+          - REQUIRED_SECTIONS: List of sections that must appear in the final document.
+          - COMPLIANCE_THRESHOLDS: Dictionary with thresholds for key metrics.
+          - VERSION: Document version information.
+          - ORGANIZATION: Name of the organization producing the document.
+        """
+        self.config = config
+        self.document_template = config.get("DOCUMENT_TEMPLATE", self.default_template())
+        self.required_sections = config.get("REQUIRED_SECTIONS", [
+            "Executive Summary", "Methodology", "Results", "Risk Analysis", "Compliance Statement", "Appendix"
+        ])
+        self.compliance_thresholds = config.get("COMPLIANCE_THRESHOLDS", {
+            "risk_score": 5.0  # Example: risk scores must be below 5.0
+        })
+        self.version = config.get("VERSION", "1.0")
+        self.organization = config.get("ORGANIZATION", "Innovative Drug Discovery Inc.")
+        logger.info("Regulatory Documentation Module initialized.")
+
+    @staticmethod
+    def default_template() -> str:
+        """
+        Returns a default document template with placeholders.
+        """
+        template = (
+            "Regulatory Submission Document\n"
+            "===============================\n\n"
+            "Organization: {organization}\n"
+            "Document Version: {version}\n"
+            "Submission Date: {submission_date}\n"
+            "Pipeline Run ID: {run_id}\n\n"
+            "Executive Summary:\n"
+            "{executive_summary}\n\n"
+            "Methodology:\n"
+            "{methodology}\n\n"
+            "Results:\n"
+            "{results}\n\n"
+            "Risk Analysis:\n"
+            "{risk_analysis}\n\n"
+            "Compliance Statement:\n"
+            "{compliance_statement}\n\n"
+            "Appendix:\n"
+            "{appendix}\n"
+        )
+        return template
+
+    def generate_documentation(self, pipeline_report: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate a regulatory document based on the full pipeline report.
+        
+        pipeline_report: A dictionary containing outputs from the entire pipeline.
+        
+        Returns a dictionary with:
+          - "document_text": The generated regulatory document as a string.
+          - "audit_trail": A JSON object with metadata and versioning info.
+          - "compliance_issues": A list of detected compliance issues (if any).
+        """
+        # Extract metadata from the pipeline report.
+        run_id = pipeline_report.get("run_id", "Unknown")
+        topic = pipeline_report.get("topic", "N/A")
+        timestamp = pipeline_report.get("timestamp", datetime.utcnow().isoformat())
+        
+        # Generate document sections.
+        executive_summary = self._generate_executive_summary(pipeline_report)
+        methodology = self._generate_methodology(pipeline_report)
+        results = self._generate_results(pipeline_report)
+        risk_analysis = self._generate_risk_analysis(pipeline_report)
+        compliance_statement, compliance_issues = self._generate_compliance_statement(pipeline_report)
+        appendix = self._generate_appendix(pipeline_report)
+        
+        # Fill in the template.
+        document_text = self.document_template.format(
+            organization=self.organization,
+            version=self.version,
+            submission_date=timestamp,
+            run_id=run_id,
+            executive_summary=executive_summary,
+            methodology=methodology,
+            results=results,
+            risk_analysis=risk_analysis,
+            compliance_statement=compliance_statement,
+            appendix=appendix
+        )
+        
+        # Create audit trail.
+        audit_trail = {
+            "run_id": run_id,
+            "topic": topic,
+            "timestamp": timestamp,
+            "version": self.version,
+            "organization": self.organization,
+            "parameters": self.config
+        }
+        
+        logger.info("Regulatory documentation generated successfully.")
+        return {
+            "document_text": document_text,
+            "audit_trail": audit_trail,
+            "compliance_issues": compliance_issues
+        }
+    
+    def _generate_executive_summary(self, report: Dict[str, Any]) -> str:
+        """
+        Generate the Executive Summary section from the pipeline report.
+        """
+        summary_lines = [
+            f"Topic: {report.get('topic', 'N/A')}",
+            f"Overview: This document summarizes the findings from the integrated drug discovery pipeline.",
+            f"Key Outcomes: The pipeline identified promising candidates, validated through in‑silico simulations and preliminary experimental data."
+        ]
+        return "\n".join(summary_lines)
+    
+    def _generate_methodology(self, report: Dict[str, Any]) -> str:
+        """
+        Generate the Methodology section from the pipeline report.
+        """
+        methodology = (
+            "The pipeline integrated advanced AI algorithms spanning literature mining, protein structure analysis, "
+            "molecular docking, generative optimization, and genome editing design. Each module contributed specific insights "
+            "and quantitative metrics, which were aggregated and refined through a feedback-driven continual learning process."
+        )
+        return methodology
+    
+    def _generate_results(self, report: Dict[str, Any]) -> str:
+        """
+        Generate the Results section summarizing key quantitative findings.
+        """
+        # For demonstration, summarize some key metrics.
+        try:
+            docking = report.get("docking_results", {})
+            optimized = report.get("optimized_candidates", {})
+            genome_edit = report.get("genome_editing_design", {})
+            lines = []
+            for candidate, data in docking.items():
+                binding_affinity = data.get("mean_binding_free_energy", "N/A")
+                candidate_summary = optimized.get(candidate, {})
+                guide_info = genome_edit.get(candidate, {})
+                line = (f"Candidate {candidate}: Mean Binding Free Energy = {binding_affinity:.2f} kcal/mol; "
+                        f"Optimized Candidate SMILES = {candidate_summary.get('smiles', 'N/A')}; "
+                        f"Guide RNA = {guide_info.get('guide_RNA', 'N/A')}")
+                lines.append(line)
+            if not lines:
+                lines.append("No docking or optimization results available.")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.error(f"Error generating results section: {e}")
+            return "Results data incomplete."
+    
+    def _generate_risk_analysis(self, report: Dict[str, Any]) -> str:
+        """
+        Generate the Risk Analysis section from pipeline outputs.
+        """
+        # In a real system, this would analyze uncertainties, toxicity predictions, off-target risks, etc.
+        risk_data = "Preliminary risk metrics indicate acceptable safety margins; however, further experimental validation is required."
+        return risk_data
+    
+    def _generate_compliance_statement(self, report: Dict[str, Any]) -> (str, list):
+        """
+        Generate the Compliance Statement section, checking for required metrics and thresholds.
+        Returns a tuple of (compliance_statement, compliance_issues).
+        """
+        compliance_issues = []
+        # Check if key risk metrics meet thresholds.
+        risk_score = report.get("feedback_report", {}).get("property_predictor", {}).get("loss", None)
+        threshold = self.compliance_thresholds.get("risk_score", 5.0)
+        if risk_score is not None and risk_score > threshold:
+            issue = f"Risk score {risk_score:.2f} exceeds threshold of {threshold:.2f}."
+            compliance_issues.append(issue)
+        # Check that all required sections are generated.
+        generated_sections = ["Executive Summary", "Methodology", "Results", "Risk Analysis", "Compliance Statement", "Appendix"]
+        missing_sections = [sec for sec in self.required_sections if sec not in generated_sections]
+        if missing_sections:
+            compliance_issues.append(f"Missing required sections: {missing_sections}")
+        if compliance_issues:
+            compliance_statement = "Compliance issues detected: " + "; ".join(compliance_issues)
+        else:
+            compliance_statement = "All compliance checks passed."
+        return compliance_statement, compliance_issues
+    
+    def _generate_appendix(self, report: Dict[str, Any]) -> str:
+        """
+        Generate the Appendix section, including raw data and supplementary information.
+        """
+        appendix = (
+            "Raw Pipeline Data:\n" +
+            json.dumps(report, indent=2)
+        )
+        return appendix
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Example configuration for the Regulatory Documentation Module.
+    config = {
+        "DOCUMENT_TEMPLATE": None,  # Use default template.
+        "REQUIRED_SECTIONS": ["Executive Summary", "Methodology", "Results", "Risk Analysis", "Compliance Statement", "Appendix"],
+        "COMPLIANCE_THRESHOLDS": {"risk_score": 5.0},
+        "VERSION": "1.0",
+        "ORGANIZATION": "Innovative Drug Discovery Inc."
+    }
+    
+    reg_module = RegulatoryDocumentationModule(config)
+    
+    # Simulate a pipeline report from the orchestrator.
+    pipeline_report = {
+        "run_id": 101,
+        "topic": "Brain growth and neurogenesis",
+        "timestamp": datetime.utcnow().isoformat(),
+        "research_data": {"entities": ["ProteinA", "ProteinB"]},
+        "protein_data": {"ProteinA": "StructureData_A", "ProteinB": "StructureData_B"},
+        "docking_results": {
+            "ProteinA": {"mean_binding_free_energy": -7.2},
+            "ProteinB": {"mean_binding_free_energy": -6.8}
+        },
+        "optimized_candidates": {
+            "ProteinA": {"smiles": "CCO", "composite_score": -7.1},
+            "ProteinB": {"smiles": "CCC", "composite_score": -6.9}
+        },
+        "genome_editing_design": {
+            "ProteinA": {"guide_RNA": "ACGTACGTACGTACGTACGT"},
+            "ProteinB": {"guide_RNA": "TGCATGCATGCATGCATGCA"}
+        },
+        "feedback_report": {
+            "property_predictor": {"loss": 0.45, "metrics": {"param_norm": 2.34}}
+        }
+    }
+    
+    documentation = reg_module.generate_documentation(pipeline_report)
+    print("Generated Regulatory Document:")
+    print(documentation["document_text"])
+    print("\nAudit Trail:")
+    print(json.dumps(documentation["audit_trail"], indent=2))
+    if documentation["compliance_issues"]:
+        print("\nCompliance Issues:")
+        print(documentation["compliance_issues"])
+    else:
+        print("\nNo compliance issues detected.")
