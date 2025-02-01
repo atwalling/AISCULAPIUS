@@ -1,0 +1,245 @@
+# continuous_improvement_module.py
+
+import os
+import json
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Any, List
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+import openai  # For ChatGPT integration
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "ContinuousImprovementModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("ContinuousImprovementModule")
+
+
+class ContinuousImprovementModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Continuous Improvement and Self-Assessment Module.
+        
+        Config parameters include:
+          - HISTORY_LOG_FILE: Path to the JSON file storing historical candidate and pipeline performance data.
+          - MOVING_AVERAGE_WINDOW: Number of recent runs to consider when computing trends.
+          - IMPROVEMENT_THRESHOLD: Minimal percentage improvement expected; if not achieved, triggers hyperparameter adjustments.
+          - INITIAL_HYPERPARAMETERS: Dictionary of hyperparameters that influence exploration (e.g., exploration_weight, diversity_threshold, learning_rate).
+          - META_UPDATE_INTERVAL: Time interval (in days) at which meta-learning updates are performed.
+          - CHATGPT_MODEL: Model to use for expert summarization (e.g., "gpt-4").
+          - OPENAI_API_KEY: API key for ChatGPT integration.
+        """
+        self.config = config
+        self.history_log_file = config.get("HISTORY_LOG_FILE", "update_history.json")
+        self.moving_avg_window = config.get("MOVING_AVERAGE_WINDOW", 10)
+        self.improvement_threshold = config.get("IMPROVEMENT_THRESHOLD", 0.05)  # 5% improvement
+        self.initial_hyperparams = config.get("INITIAL_HYPERPARAMETERS", {
+            "exploration_weight": 1.0,
+            "diversity_threshold": 0.3,
+            "learning_rate": 0.01
+        })
+        self.meta_update_interval_days = config.get("META_UPDATE_INTERVAL", 7)
+        self.chatgpt_model = config.get("CHATGPT_MODEL", "gpt-4")
+        self.openai_api_key = config.get("OPENAI_API_KEY")
+        if self.openai_api_key:
+            openai.api_key = self.openai_api_key
+        else:
+            logger.warning("No OpenAI API key provided; expert summarization will be skipped.")
+        self.hyperparameters = self.initial_hyperparams.copy()
+        self.last_meta_update = datetime.utcnow() - timedelta(days=self.meta_update_interval_days + 1)
+        
+        # Load historical update logs.
+        self.history = self._load_history()
+        logger.info("Continuous Improvement Module initialized.")
+
+    def _load_history(self) -> List[Dict[str, Any]]:
+        """
+        Load historical update logs from the specified file.
+        Returns a list of historical records; if file not found, returns an empty list.
+        """
+        if os.path.exists(self.history_log_file):
+            try:
+                with open(self.history_log_file, "r") as f:
+                    history = json.load(f)
+                logger.info(f"Loaded {len(history)} historical update records.")
+                return history
+            except Exception as e:
+                logger.error(f"Error loading history: {e}")
+                return []
+        else:
+            logger.info("No history log file found; starting with an empty history.")
+            return []
+
+    def _save_history(self) -> None:
+        """
+        Save the current history to the history log file.
+        """
+        try:
+            with open(self.history_log_file, "w") as f:
+                json.dump(self.history, f, indent=2)
+            logger.info("Historical update log saved.")
+        except Exception as e:
+            logger.error(f"Error saving history: {e}")
+
+    def compute_trends(self) -> Dict[str, Any]:
+        """
+        Compute trends from the historical update logs.
+        
+        For demonstration, we assume each historical record includes a dictionary of hyperparameters and a loss metric.
+        We compute the moving average loss over the last MOVING_AVERAGE_WINDOW runs.
+        
+        Returns a dictionary with computed trends.
+        """
+        if not self.history:
+            logger.warning("No historical data available; returning default trends.")
+            return {"average_loss": None, "trend": "insufficient data"}
+        
+        # Extract loss values from history; assume each record has "update_summary" containing a "loss" field for a key model.
+        losses = []
+        for record in self.history[-self.moving_avg_window:]:
+            # For simplicity, average losses over all models in the update record.
+            update_summary = record.get("update_summary", {})
+            model_losses = [val.get("loss", 0) for val in update_summary.values()]
+            if model_losses:
+                losses.append(np.mean(model_losses))
+        if not losses:
+            avg_loss = None
+        else:
+            avg_loss = float(np.mean(losses))
+        # Determine trend (dummy logic: if last loss is higher than average, trend is "worsening")
+        if losses:
+            trend = "improving" if losses[-1] < avg_loss else "worsening"
+        else:
+            trend = "insufficient data"
+        trends = {"average_loss": avg_loss, "trend": trend, "num_records": len(losses)}
+        logger.info(f"Computed historical trends: {trends}")
+        return trends
+
+    def adjust_hyperparameters(self, trends: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Adjust hyperparameters based on historical trends.
+        
+        For example, if the trend indicates that loss is not improving (or worsening), increase the exploration weight.
+        Returns a dictionary with the new hyperparameters.
+        """
+        adjustments = {}
+        if trends.get("trend") == "worsening":
+            # Increase exploration_weight by 10% and relax diversity_threshold slightly.
+            new_exploration_weight = self.hyperparameters["exploration_weight"] * 1.1
+            new_diversity_threshold = min(self.hyperparameters["diversity_threshold"] + 0.05, 1.0)
+            adjustments["exploration_weight"] = new_exploration_weight
+            adjustments["diversity_threshold"] = new_diversity_threshold
+        elif trends.get("trend") == "improving":
+            # Optionally, slightly reduce exploration if improvement is steady.
+            new_exploration_weight = self.hyperparameters["exploration_weight"] * 0.95
+            adjustments["exploration_weight"] = new_exploration_weight
+            # Keep diversity threshold constant.
+            adjustments["diversity_threshold"] = self.hyperparameters["diversity_threshold"]
+        else:
+            adjustments = self.hyperparameters.copy()
+        
+        # Also, adjust learning rate based on the number of records.
+        if trends.get("num_records", 0) >= self.moving_avg_window:
+            adjustments["learning_rate"] = self.hyperparameters["learning_rate"] * 0.98  # slight decay
+        
+        # Update hyperparameters.
+        self.hyperparameters.update(adjustments)
+        self.last_meta_update = datetime.utcnow()
+        logger.info(f"Hyperparameters adjusted based on trends: {self.hyperparameters}")
+        return self.hyperparameters
+
+    def generate_expert_summary(self, trends: Dict[str, Any], hyperparams: Dict[str, Any]) -> str:
+        """
+        Generate an expert-level summary of the continuous improvement analysis using ChatGPT.
+        Returns a string summary.
+        """
+        try:
+            summary_text = (
+                "Continuous Improvement Analysis Report:\n"
+                f"- Average Loss over last {self.moving_avg_window} runs: {trends.get('average_loss')}\n"
+                f"- Trend: {trends.get('trend')}\n"
+                f"- Proposed Hyperparameter Adjustments: {hyperparams}\n"
+            )
+            prompt = (
+                "You are an expert in AI meta-learning and drug discovery pipeline optimization. Analyze the following continuous improvement report and provide a concise summary of recommendations to further improve exploration and candidate novelty, while ensuring alignment with solving high-impact diseases:\n\n"
+                + summary_text +
+                "\n\nYour Expert Summary:"
+            )
+            response = openai.ChatCompletion.create(
+                model=self.chatgpt_model,
+                messages=[
+                    {"role": "system", "content": "You are a top expert in AI meta-learning and optimization."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=200,
+            )
+            expert_summary = response.choices[0].message["content"].strip()
+            logger.info("Expert summary generated via ChatGPT for continuous improvement.")
+            return expert_summary
+        except Exception as e:
+            logger.error(f"Error generating expert summary: {e}")
+            return "Expert summary unavailable due to an error."
+
+    def run(self) -> Dict[str, Any]:
+        """
+        Execute the continuous improvement and self-assessment workflow.
+        
+        This method:
+          1. Loads historical performance data.
+          2. Computes trends (e.g., moving average loss, trend direction).
+          3. Adjusts hyperparameters based on trends.
+          4. Generates a detailed report including expert recommendations.
+        
+        Returns a dictionary containing:
+          - "trends": Computed historical trends.
+          - "updated_hyperparameters": The new hyperparameters after adjustment.
+          - "expert_summary": Expert-level interpretation of the analysis.
+        """
+        trends = self.compute_trends()
+        updated_hyperparams = self.adjust_hyperparameters(trends)
+        expert_summary = self.generate_expert_summary(trends, updated_hyperparams)
+        
+        report = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "trends": trends,
+            "updated_hyperparameters": updated_hyperparams,
+            "expert_summary": expert_summary
+        }
+        # Append report to history.
+        self.history.append(report)
+        self._save_history()
+        logger.info("Continuous improvement run completed.")
+        return report
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the Continuous Improvement Module.
+    config = {
+        "HISTORY_LOG_FILE": "update_history.json",
+        "MOVING_AVERAGE_WINDOW": 10,
+        "IMPROVEMENT_THRESHOLD": 0.05,
+        "INITIAL_HYPERPARAMETERS": {
+            "exploration_weight": 1.0,
+            "diversity_threshold": 0.3,
+            "learning_rate": 0.01
+        },
+        "META_UPDATE_INTERVAL": 7,
+        "CHATGPT_MODEL": "gpt-4",
+        "OPENAI_API_KEY": "your_openai_api_key_here",  # Replace with your actual API key.
+    }
+    
+    ci_module = ContinuousImprovementModule(config)
+    improvement_report = ci_module.run()
+    print("Continuous Improvement & Self-Assessment Report:")
+    print(json.dumps(improvement_report, indent=2))
