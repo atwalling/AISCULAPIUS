@@ -1,0 +1,325 @@
+# clinical_outcome_decision_module.py
+
+import json
+import logging
+import time
+from datetime import datetime
+from typing import Dict, Any, List
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.preprocessing import MinMaxScaler
+
+import openai  # For ChatGPT integration
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "ClinicalOutcomeDecisionModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("ClinicalOutcomeDecisionModule")
+
+
+class ClinicalOutcomeDecisionModule:
+    def __init__(self, config: Dict[str, Any]):
+        """
+        Initialize the Clinical Outcome Integration & Decision Support Module.
+        
+        Config parameters include:
+          - CRITERIA_WEIGHTS: Dictionary with weights for each criterion. Example:
+                {"efficacy": 0.5, "risk": 0.3, "admet": 0.2, "disease_prevalence": 0.4}
+          - UNCERTAINTY_PENALTY: Factor by which uncertainty (standard deviation) reduces the effective score.
+          - PATIENT_DATA_FILE: (Optional) Path to epidemiological/patient prevalence data (CSV/JSON). If None, dummy data is used.
+          - CHATGPT_MODEL: Model to use for expert interpretation (e.g., "gpt-4").
+          - OPENAI_API_KEY: API key for ChatGPT integration.
+          - DEVICE: "cuda" or "cpu" (for potential neural network computations).
+        """
+        self.config = config
+        self.criteria_weights = config.get("CRITERIA_WEIGHTS", {
+            "efficacy": 0.5,
+            "risk": 0.3,
+            "admet": 0.2,
+            "disease_prevalence": 0.4
+        })
+        self.uncertainty_penalty = config.get("UNCERTAINTY_PENALTY", 0.1)
+        self.patient_data_file = config.get("PATIENT_DATA_FILE", None)
+        self.chatgpt_model = config.get("CHATGPT_MODEL", "gpt-4")
+        self.openai_api_key = config.get("OPENAI_API_KEY", None)
+        if self.openai_api_key:
+            openai.api_key = self.openai_api_key
+        else:
+            logger.warning("No OpenAI API key provided; ChatGPT summarization will be skipped.")
+        self.device = torch.device(config.get("DEVICE", "cuda" if torch.cuda.is_available() else "cpu"))
+        
+        # Load or simulate patient epidemiological data.
+        self.patient_data = self._load_patient_data()
+        # Normalize epidemiological data (e.g., disease prevalence) for integration.
+        self.scaler = MinMaxScaler()
+        self._normalize_patient_data()
+        
+        logger.info("Clinical Outcome Integration Module initialized.")
+
+    def _load_patient_data(self) -> pd.DataFrame:
+        """
+        Load patient epidemiological data from a CSV/JSON file.
+        Expected columns: Disease, Prevalence (fraction of population).
+        If file not provided, generate dummy data.
+        Returns a Pandas DataFrame.
+        """
+        if self.patient_data_file and os.path.exists(self.patient_data_file):
+            try:
+                if self.patient_data_file.endswith('.csv'):
+                    df = pd.read_csv(self.patient_data_file)
+                elif self.patient_data_file.endswith('.json'):
+                    df = pd.read_json(self.patient_data_file)
+                else:
+                    logger.error("Unsupported patient data file format.")
+                    raise ValueError("Unsupported file format.")
+                logger.info(f"Patient data loaded from {self.patient_data_file}.")
+                return df
+            except Exception as e:
+                logger.error(f"Error loading patient data: {e}")
+                raise e
+        else:
+            logger.warning("No patient data file provided; generating dummy epidemiological data.")
+            data = {
+                "Disease": ["DiseaseA", "DiseaseB", "DiseaseC"],
+                "Prevalence": [0.2, 0.1, 0.05]  # Fraction of global population
+            }
+            df = pd.DataFrame(data)
+            return df
+
+    def _normalize_patient_data(self):
+        """
+        Normalize the 'Prevalence' column in patient data using min-max scaling.
+        """
+        if "Prevalence" in self.patient_data.columns:
+            self.patient_data["Prevalence_norm"] = self.scaler.fit_transform(self.patient_data[["Prevalence"]])
+            logger.debug("Patient data normalized.")
+        else:
+            logger.warning("Patient data missing 'Prevalence' column; skipping normalization.")
+
+    def integrate_candidate_and_patient_data(self, candidate_predictions: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+        """
+        Integrate candidate-level predictions with epidemiological data.
+        
+        candidate_predictions: Dictionary mapping candidate IDs to a dictionary with predicted metrics:
+            Example:
+              {
+                "Candidate_1": {
+                    "efficacy": {"mean": 0.8, "std": 0.05},
+                    "risk": {"mean": 0.2, "std": 0.03},
+                    "admet": {"composite_score": -7.0, "std": 0.4}
+                },
+                ...
+              }
+              
+        The integration is done by merging candidate predictions with disease prevalence data
+        based on the target disease that each candidate addresses. For demonstration, we assume
+        that each candidate has an associated "disease" field in its predictions.
+        
+        Returns a Pandas DataFrame with one row per candidate, including integrated fields.
+        """
+        records = []
+        for cand_id, preds in candidate_predictions.items():
+            disease = preds.get("disease", "Unknown")
+            # Look up disease prevalence from patient data.
+            prevalence_row = self.patient_data[self.patient_data["Disease"] == disease]
+            if not prevalence_row.empty:
+                prevalence_norm = float(prevalence_row["Prevalence_norm"].iloc[0])
+            else:
+                prevalence_norm = 0.0  # If disease not found, assume minimal prevalence.
+            record = {
+                "candidate_id": cand_id,
+                "disease": disease,
+                "efficacy_mean": preds.get("efficacy", {}).get("mean", np.nan),
+                "efficacy_std": preds.get("efficacy", {}).get("std", np.nan),
+                "risk_mean": preds.get("risk", {}).get("mean", np.nan),
+                "risk_std": preds.get("risk", {}).get("std", np.nan),
+                "admet_score": preds.get("admet", {}).get("composite_score", np.nan),
+                "admet_std": preds.get("admet", {}).get("std", np.nan),
+                "prevalence_norm": prevalence_norm
+            }
+            records.append(record)
+        df = pd.DataFrame(records)
+        logger.info(f"Integrated candidate data for {len(df)} candidates.")
+        return df
+
+    def compute_candidate_scores(self, integrated_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute an overall clinical outcome score for each candidate using a multi-criteria weighted sum.
+        The score factors in:
+          - Efficacy (higher is better)
+          - Risk (lower is better)
+          - ADMET (higher composite score is better, adjusted by uncertainty)
+          - Disease prevalence (higher prevalence increases priority)
+          
+        Uncertainty (std) values are used to penalize scores.
+        
+        Returns the DataFrame with an additional column "clinical_score".
+        """
+        df = integrated_df.copy()
+        # Normalize efficacy, risk, admet_score across candidates.
+        scaler = MinMaxScaler()
+        # For efficacy and admet_score, higher is better; for risk, lower is better.
+        # We'll invert risk later.
+        df["efficacy_norm"] = scaler.fit_transform(df[["efficacy_mean"]])
+        df["risk_norm"] = scaler.fit_transform(df[["risk_mean"]])
+        df["admet_norm"] = scaler.fit_transform(df[["admet_score"]])
+        
+        # Compute uncertainty penalty: higher std should reduce effective score.
+        # For simplicity, we subtract a fraction of the std.
+        efficacy_penalty = df["efficacy_std"].fillna(0) * self.uncertainty_penalty
+        risk_penalty = df["risk_std"].fillna(0) * self.uncertainty_penalty
+        admet_penalty = df["admet_std"].fillna(0) * self.uncertainty_penalty
+        
+        # Weighted sum calculation.
+        # Note: For risk, lower is better, so we invert the normalized risk.
+        df["clinical_score"] = (
+            self.criteria_weight("efficacy", self.criteria_weights) * (df["efficacy_norm"] - efficacy_penalty) -
+            self.criteria_weight("risk", self.criteria_weights) * (df["risk_norm"] - risk_penalty) +
+            self.criteria_weight("admet", self.criteria_weights) * (df["admet_norm"] - admet_penalty) +
+            self.criteria_weight("disease_prevalence", self.criteria_weights) * df["prevalence_norm"]
+        )
+        # Lower clinical_score might indicate higher overall desirability (depending on weight sign conventions)
+        # We can choose to rank in ascending or descending order; here, we assume higher clinical_score is better.
+        logger.info("Candidate clinical scores computed.")
+        return df
+
+    def criteria_weight(self, criterion: str, weights: Dict[str, float]) -> float:
+        """
+        Helper function to retrieve the weight for a given criterion.
+        """
+        return weights.get(criterion, 1.0)
+
+    def generate_decision_report(self, candidate_scores_df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Generate a comprehensive decision report including:
+          - Ranked list of candidates with their clinical scores.
+          - A summary of key metrics and uncertainties.
+          - An expert-level interpretation via ChatGPT.
+        
+        Returns a dictionary with the report.
+        """
+        # Rank candidates by clinical_score in descending order.
+        ranked_df = candidate_scores_df.sort_values(by="clinical_score", ascending=False).reset_index(drop=True)
+        ranked_candidates = ranked_df.to_dict(orient="records")
+        
+        # Create a textual summary.
+        summary_text = "Clinical Outcome Decision Report:\n\n"
+        for idx, row in enumerate(ranked_candidates):
+            summary_text += (f"{idx+1}. Candidate {row['candidate_id']} (Disease: {row['disease']}): "
+                             f"Clinical Score = {row['clinical_score']:.3f}, "
+                             f"Efficacy = {row['efficacy_mean']:.3f}, "
+                             f"Risk = {row['risk_mean']:.3f}, "
+                             f"ADMET = {row['admet_score']:.3f}, "
+                             f"Disease Prevalence = {row['prevalence_norm']:.3f}\n")
+        
+        # Obtain expert interpretation via ChatGPT.
+        try:
+            prompt = (
+                "You are a world-class clinical expert in drug development. Below is a summary of candidate "
+                "clinical outcome predictions derived from integrated multi-criteria analysis. Please provide a "
+                "concise expert interpretation that highlights the most promising candidates and offers recommendations "
+                "for further clinical evaluation.\n\n" +
+                summary_text +
+                "\n\nYour expert interpretation:"
+            )
+            response = openai.ChatCompletion.create(
+                model=self.chatgpt_model,
+                messages=[
+                    {"role": "system", "content": "You are a leading clinical expert in drug discovery."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=300,
+            )
+            expert_interpretation = response.choices[0].message["content"].strip()
+            logger.info("Expert interpretation generated via ChatGPT for clinical decision report.")
+        except Exception as e:
+            logger.error(f"Error generating expert interpretation: {e}")
+            expert_interpretation = "Expert interpretation unavailable due to an error."
+        
+        report = {
+            "ranked_candidates": ranked_candidates,
+            "summary_text": summary_text,
+            "expert_interpretation": expert_interpretation
+        }
+        return report
+
+    def run(self, candidate_predictions: Dict[str, Dict[str, Any]], patient_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute the clinical outcome integration and decision support workflow.
+        
+        candidate_predictions: Dictionary mapping candidate IDs to their predicted clinical metrics,
+                               including "efficacy", "risk", "admet", and optionally "disease" field.
+        patient_data: Dictionary mapping disease names to epidemiological data (if not already loaded, dummy data is used).
+        
+        Returns a decision report as a dictionary.
+        """
+        # For this module, we assume candidate_predictions already include a "disease" field.
+        # Integrate candidate predictions with epidemiological data.
+        integrated_df = self.integrate_candidate_and_patient_data(candidate_predictions)
+        # Compute composite clinical scores.
+        candidate_scores_df = self.compute_candidate_scores(integrated_df)
+        # Generate a decision report.
+        decision_report = self.generate_decision_report(candidate_scores_df)
+        logger.info("Clinical Outcome Integration & Decision Support completed.")
+        return decision_report
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Configuration for the Clinical Outcome Integration Module.
+    config = {
+        "CRITERIA_WEIGHTS": {
+            "efficacy": 0.5,
+            "risk": 0.3,
+            "admet": 0.2,
+            "disease_prevalence": 0.4
+        },
+        "UNCERTAINTY_PENALTY": 0.1,
+        "PATIENT_DATA_FILE": None,  # Use dummy data.
+        "CHATGPT_MODEL": "gpt-4",
+        "OPENAI_API_KEY": "your_openai_api_key_here",  # Replace with your API key.
+        "DEVICE": "cpu"
+    }
+    
+    # Instantiate the module.
+    clinical_module = ClinicalOutcomeDecisionModule(config)
+    
+    # Simulate candidate predictions.
+    # Each candidate prediction includes predicted efficacy, risk, ADMET (composite score), and an associated disease.
+    candidate_predictions = {
+        "Candidate_1": {
+            "disease": "DiseaseA",
+            "efficacy": {"mean": 0.85, "std": 0.05},
+            "risk": {"mean": 0.25, "std": 0.03},
+            "admet": {"composite_score": -7.0, "std": 0.4}
+        },
+        "Candidate_2": {
+            "disease": "DiseaseB",
+            "efficacy": {"mean": 0.75, "std": 0.06},
+            "risk": {"mean": 0.20, "std": 0.02},
+            "admet": {"composite_score": -6.8, "std": 0.35}
+        },
+        "Candidate_3": {
+            "disease": "DiseaseC",
+            "efficacy": {"mean": 0.80, "std": 0.04},
+            "risk": {"mean": 0.30, "std": 0.05},
+            "admet": {"composite_score": -7.2, "std": 0.45}
+        }
+    }
+    
+    # Simulate patient data: mapping disease names to prevalence data.
+    # For simplicity, we assume our patient_data DataFrame (loaded in _load_patient_data) contains the required information.
+    # If needed, we can override or simulate additional patient data.
+    # Here, we pass an empty dict since the module loads dummy patient data.
+    patient_data = {}
+    
+    decision_report = clinical_module.run(candidate_predictions, patient_data)
+    print("Clinical Outcome Integration & Decision Support Report:")
+    print(json.dumps(decision_report, indent=2))
