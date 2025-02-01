@@ -1,0 +1,206 @@
+# data_integration_management_module.py
+
+import json
+import logging
+import time
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+
+import numpy as np
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+
+# Setup structured logging.
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='{"timestamp": "%(asctime)s", "module": "DataIntegrationModule", "level": "%(levelname)s", "message": %(message)s}'
+)
+logger = logging.getLogger("DataIntegrationModule")
+
+# Create the SQLAlchemy Base.
+Base = declarative_base()
+
+# Define the PipelineRun table.
+class PipelineRun(Base):
+    __tablename__ = "pipeline_runs"
+    id = Column(Integer, primary_key=True)
+    topic = Column(String(256), nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    metadata_json = Column(Text)  # JSON string of parameters and versioning info.
+    # Relationship to module outputs.
+    module_outputs = relationship("ModuleOutput", back_populates="pipeline_run", cascade="all, delete-orphan")
+
+# Define the ModuleOutput table.
+class ModuleOutput(Base):
+    __tablename__ = "module_outputs"
+    id = Column(Integer, primary_key=True)
+    run_id = Column(Integer, ForeignKey("pipeline_runs.id"), nullable=False)
+    module_name = Column(String(128), nullable=False)
+    output_json = Column(Text)  # JSON string of module output.
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    # Relationship back to the run.
+    pipeline_run = relationship("PipelineRun", back_populates="module_outputs")
+
+class DataManager:
+    def __init__(self, db_url: Optional[str] = None):
+        """
+        Initialize the Data Manager.
+        
+        db_url: Database URL. If not provided, uses an SQLite file 'pipeline_data.db' in the current directory.
+        """
+        self.db_url = db_url or "sqlite:///pipeline_data.db"
+        self.engine = create_engine(self.db_url, echo=False, future=True)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        logger.info(f"DataManager initialized with DB URL: {self.db_url}")
+
+    def store_pipeline_run(self, run_data: Dict[str, Any], module_outputs: Dict[str, Any]) -> int:
+        """
+        Store a complete pipeline run.
+        
+        run_data: Dictionary with keys such as 'topic', 'metadata' (which should be JSON-serializable).
+        module_outputs: Dictionary mapping module names to their output (each output must be JSON-serializable).
+        
+        Returns the unique run ID.
+        """
+        session = self.Session()
+        try:
+            run = PipelineRun(
+                topic=run_data.get("topic", "Unknown"),
+                metadata_json=json.dumps(run_data.get("metadata", {}))
+            )
+            session.add(run)
+            session.flush()  # Assigns an ID.
+            run_id = run.id
+            logger.debug(f"Storing PipelineRun with ID: {run_id}")
+
+            # Store each module's output.
+            for module_name, output in module_outputs.items():
+                module_record = ModuleOutput(
+                    run_id=run_id,
+                    module_name=module_name,
+                    output_json=json.dumps(output)
+                )
+                session.add(module_record)
+            session.commit()
+            logger.info(f"Pipeline run stored successfully with ID: {run_id}")
+            return run_id
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error storing pipeline run: {e}")
+            raise e
+        finally:
+            session.close()
+
+    def get_pipeline_run(self, run_id: int) -> Dict[str, Any]:
+        """
+        Retrieve a pipeline run and its module outputs by run ID.
+        
+        Returns a dictionary with run metadata and a dictionary of module outputs.
+        """
+        session = self.Session()
+        try:
+            run = session.query(PipelineRun).filter(PipelineRun.id == run_id).first()
+            if run is None:
+                logger.warning(f"No pipeline run found with ID: {run_id}")
+                return {}
+            run_dict = {
+                "id": run.id,
+                "topic": run.topic,
+                "timestamp": run.timestamp.isoformat(),
+                "metadata": json.loads(run.metadata_json) if run.metadata_json else {}
+            }
+            outputs = {}
+            for module_output in run.module_outputs:
+                outputs[module_output.module_name] = json.loads(module_output.output_json)
+            run_dict["module_outputs"] = outputs
+            logger.info(f"Retrieved pipeline run with ID: {run_id}")
+            return run_dict
+        except Exception as e:
+            logger.error(f"Error retrieving pipeline run: {e}")
+            raise e
+        finally:
+            session.close()
+
+    def list_pipeline_runs(self) -> List[Dict[str, Any]]:
+        """
+        List all pipeline runs (summary only).
+        
+        Returns a list of dictionaries, each containing the run ID, topic, and timestamp.
+        """
+        session = self.Session()
+        try:
+            runs = session.query(PipelineRun).all()
+            run_list = []
+            for run in runs:
+                run_list.append({
+                    "id": run.id,
+                    "topic": run.topic,
+                    "timestamp": run.timestamp.isoformat()
+                })
+            logger.info(f"Listed {len(run_list)} pipeline runs.")
+            return run_list
+        except Exception as e:
+            logger.error(f"Error listing pipeline runs: {e}")
+            raise e
+        finally:
+            session.close()
+
+    def export_all_runs_to_json(self, file_path: str) -> None:
+        """
+        Export all pipeline runs and their module outputs to a JSON file.
+        """
+        all_runs = self.list_pipeline_runs()
+        detailed_runs = []
+        for run_info in all_runs:
+            run_id = run_info["id"]
+            run_data = self.get_pipeline_run(run_id)
+            detailed_runs.append(run_data)
+        with open(file_path, "w") as f:
+            json.dump(detailed_runs, f, indent=2, default=str)
+        logger.info(f"Exported {len(detailed_runs)} pipeline runs to {file_path}")
+
+
+# Example usage (for testing purposes):
+if __name__ == "__main__":
+    # Initialize DataManager.
+    data_manager = DataManager()
+    
+    # Simulate a pipeline run data.
+    run_data = {
+        "topic": "Brain growth and neurogenesis",
+        "metadata": {
+            "version": "1.0",
+            "parameters": {
+                "learning_rate": 0.01,
+                "num_replicas": 5
+            }
+        }
+    }
+    
+    # Simulate module outputs from various stages.
+    module_outputs = {
+        "knowledge_extraction": {"entities": ["ProteinA", "ProteinB"], "raw_data": "Lorem ipsum..."},
+        "protein_analysis": {"structures": {"ProteinA": "StructureData_A", "ProteinB": "StructureData_B"}},
+        "docking_simulation": {"results": {"ProteinA": {"binding_affinity": -7.2}, "ProteinB": {"binding_affinity": -6.8}}},
+        "generative_optimization": {"candidates": {"ProteinA": {"smiles": "CCO", "affinity": -7.1}}},
+        "genome_editing": {"guide_design": {"ProteinA": {"guide_RNA": "ACGTACGTACGTACGTACGT"}}},
+        "feedback": {"updates": {"loss": 0.123, "metrics": {"param_norm": 2.34}}}
+    }
+    
+    # Store the run.
+    run_id = data_manager.store_pipeline_run(run_data, module_outputs)
+    print(f"Stored pipeline run with ID: {run_id}")
+    
+    # Retrieve and print the run.
+    retrieved_run = data_manager.get_pipeline_run(run_id)
+    print("Retrieved Pipeline Run:")
+    print(json.dumps(retrieved_run, indent=2))
+    
+    # List all runs.
+    all_runs = data_manager.list_pipeline_runs()
+    print("All Pipeline Runs:")
+    print(json.dumps(all_runs, indent=2))
+    
+    # Export all runs to a JSON file.
+    data_manager.export_all_runs_to_json("pipeline_runs_export.json")
